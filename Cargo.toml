@@ -1,6 +1,6 @@
 [package]
 name = "codex-launcher"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Pick a Codex CLI profile from a terminal menu or the command line, then launch Codex with it."
