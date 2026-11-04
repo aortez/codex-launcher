@@ -129,8 +129,11 @@ where
         Request::State | Request::Screen => None,
         Request::Key { keys } => match parse_keys(keys) {
             Ok(keys) => {
+                // Redraw after each key, as typing does, so keys such as PgDn
+                // use the layout of the profile that an earlier key selected.
                 for key in keys {
                     app.press(key);
+                    terminal.draw(|frame| ui::draw(frame, app))?;
                 }
                 None
             }

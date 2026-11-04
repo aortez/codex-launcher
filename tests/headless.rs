@@ -21,11 +21,15 @@ struct Headless {
 
 impl Headless {
     fn start(args: &[&str]) -> Self {
+        Self::start_in(&fixture_home(), args)
+    }
+
+    fn start_in(codex_home: &Path, args: &[&str]) -> Self {
         let runtime = tempfile::tempdir().unwrap();
         let child = Command::new(BIN)
             .arg("--headless")
             .args(args)
-            .env("CODEX_HOME", fixture_home())
+            .env("CODEX_HOME", codex_home)
             .env("XDG_RUNTIME_DIR", runtime.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -151,6 +155,33 @@ fn bad_requests_change_nothing() {
     let state = launcher.ctl_json(&["quit"]);
     assert_eq!(state["status"], "quitting");
     assert_eq!(launcher.finish(), "");
+}
+
+#[test]
+fn batched_keys_scroll_like_separate_keys() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("a.config.toml"), "model = \"short\"\n").unwrap();
+    let long: String = std::iter::once("model = \"long\"\n".to_owned())
+        .chain((1..=60).map(|line| format!("# filler {line}.\n")))
+        .collect();
+    std::fs::write(home.path().join("b.config.toml"), long).unwrap();
+
+    let scroll_after = |requests: &[&[&str]]| {
+        let launcher = Headless::start_in(home.path(), &["--size", "80x20"]);
+        launcher.ctl_json(&["select", "a"]);
+        let mut state = Value::Null;
+        for request in requests {
+            let mut args = vec!["key"];
+            args.extend_from_slice(request);
+            state = launcher.ctl_json(&args);
+        }
+        assert_eq!(state["selected"], "b");
+        state["details"]["scroll"].as_u64().unwrap()
+    };
+
+    let separate = scroll_after(&[&["down"], &["pgdn"]]);
+    assert!(separate > 0, "PgDn did not scroll");
+    assert_eq!(scroll_after(&[&["down", "pgdn"]]), separate);
 }
 
 #[test]

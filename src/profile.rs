@@ -20,7 +20,14 @@ const MAX_CONFIG_BYTES: u64 = 1 << 20;
 pub const REDACTED: &str = "<redacted>";
 
 /// Providers that Codex knows without a `[model_providers.<id>]` table.
-const BUILTIN_PROVIDERS: &[&str] = &["lmstudio", "ollama", "openai"];
+const BUILTIN_PROVIDERS: &[&str] = &[
+    "amazon-bedrock",
+    "amazon-bedrock-runtime",
+    "gcp",
+    "lmstudio",
+    "ollama",
+    "openai",
+];
 
 /// Key name fragments whose string values are treated as secrets.
 const SECRET_KEY_PARTS: &[&str] = &[
@@ -269,10 +276,14 @@ fn build_profile(
     layer: Option<&Table>,
     base: &Table,
 ) -> Profile {
+    let raw = redacted_text(file);
     let description = if layer.is_none() && name == DEFAULT_PROFILE {
         Some(DEFAULT_DESCRIPTION.to_owned())
+    } else if file.document.is_some() {
+        // Read the redacted text, so a commented-out secret cannot leak.
+        raw.as_deref().and_then(leading_comment)
     } else {
-        file.text.as_deref().and_then(leading_comment)
+        None
     };
     Profile {
         name,
@@ -284,7 +295,7 @@ fn build_profile(
         context_window: setting(layer, base, "model_context_window"),
         sandbox: setting(layer, base, "sandbox_mode"),
         approval: setting(layer, base, "approval_policy"),
-        raw: redacted_text(file),
+        raw,
         error: file.error.clone(),
     }
 }
@@ -319,27 +330,29 @@ fn resolve_provider(layer: Option<&Table>, base: &Table) -> Provider {
         Some(setting) => (setting.value, setting.source),
         None => ("openai".to_owned(), Source::Builtin),
     };
-    let found = layer
-        .and_then(|table| provider_table(table, &id))
-        .map(|table| (table, Source::Profile))
-        .or_else(|| provider_table(base, &id).map(|table| (table, Source::Base)));
-    match found {
-        Some((table, defined_in)) => Provider {
-            name: table.get("name").and_then(Item::as_str).map(str::to_owned),
-            base_url: table.get("base_url").and_then(Item::as_str).map(redact_url),
-            defined_in: Some(defined_in),
-            missing: false,
-            id,
-            source,
-        },
-        None => Provider {
-            missing: !BUILTIN_PROVIDERS.contains(&id.as_str()),
-            name: None,
-            base_url: None,
-            defined_in: None,
-            id,
-            source,
-        },
+    // Codex merges a profile's provider table into the base one field by
+    // field, so each field comes from the profile when set there.
+    let tables: Vec<(&dyn TableLike, Source)> =
+        [(layer, Source::Profile), (Some(base), Source::Base)]
+            .into_iter()
+            .filter_map(|(table, source)| Some((provider_table(table?, &id)?, source)))
+            .collect();
+    let field = |key: &str| {
+        tables
+            .iter()
+            .find_map(|(table, source)| Some((table.get(key)?.as_str()?, *source)))
+    };
+    let name = field("name");
+    Provider {
+        missing: tables.is_empty() && !BUILTIN_PROVIDERS.contains(&id.as_str()),
+        // The table that names the provider defines it.
+        defined_in: name
+            .map(|(_, source)| source)
+            .or_else(|| tables.first().map(|(_, source)| *source)),
+        name: name.map(|(value, _)| value.to_owned()),
+        base_url: field("base_url").map(|(value, _)| redact_url(value)),
+        id,
+        source,
     }
 }
 
@@ -628,6 +641,76 @@ base_url = "http://lab.example:11434/v1"
         let home = home_with(&[("x.config.toml", "model_provider = \"nowhere\"\n")]);
         let catalog = load(home.path()).unwrap();
         assert!(catalog.find("x").unwrap().provider.missing);
+    }
+
+    #[test]
+    fn every_builtin_provider_is_known() {
+        for id in BUILTIN_PROVIDERS {
+            let text = format!("model_provider = \"{id}\"\n");
+            let home = home_with(&[("x.config.toml", &text)]);
+            let catalog = load(home.path()).unwrap();
+            let provider = &catalog.find("x").unwrap().provider;
+            assert!(!provider.missing, "{id}");
+            assert_eq!(provider.defined_in, None, "{id}");
+        }
+    }
+
+    #[test]
+    fn provider_fields_merge_across_layers() {
+        let base = "[model_providers.lab]\nname = \"Lab\"\nbase_url = \"http://lab.example/v1\"\n";
+        let home = home_with(&[
+            ("config.toml", base),
+            (
+                "keyed.config.toml",
+                "model_provider = \"lab\"\n\n[model_providers.lab]\nenv_key = \"LAB_KEY\"\n",
+            ),
+            (
+                "moved.config.toml",
+                "model_provider = \"lab\"\n\n[model_providers.lab]\n\
+                 base_url = \"http://other.example/v1\"\n",
+            ),
+            (
+                "renamed.config.toml",
+                "model_provider = \"lab\"\n\n[model_providers.lab]\nname = \"Mine\"\n",
+            ),
+        ]);
+        let catalog = load(home.path()).unwrap();
+
+        let keyed = &catalog.find("keyed").unwrap().provider;
+        assert_eq!(keyed.name.as_deref(), Some("Lab"));
+        assert_eq!(keyed.base_url.as_deref(), Some("http://lab.example/v1"));
+        assert_eq!(keyed.defined_in, Some(Source::Base));
+        assert!(!keyed.missing);
+
+        let moved = &catalog.find("moved").unwrap().provider;
+        assert_eq!(moved.name.as_deref(), Some("Lab"));
+        assert_eq!(moved.base_url.as_deref(), Some("http://other.example/v1"));
+
+        let renamed = &catalog.find("renamed").unwrap().provider;
+        assert_eq!(renamed.name.as_deref(), Some("Mine"));
+        assert_eq!(renamed.base_url.as_deref(), Some("http://lab.example/v1"));
+        assert_eq!(renamed.defined_in, Some(Source::Profile));
+    }
+
+    #[test]
+    fn descriptions_never_show_secrets() {
+        let home = home_with(&[
+            (
+                "commented.config.toml",
+                "# Lab profile.\n# api_key = \"sk-in-comment\"\nmodel = \"m\"\n",
+            ),
+            (
+                "broken.config.toml",
+                "# token = \"sk-in-broken-file\"\nmodel = \n",
+            ),
+        ]);
+        let catalog = load(home.path()).unwrap();
+        let commented = catalog.find("commented").unwrap();
+        let description = commented.description.as_deref().unwrap();
+        assert!(!description.contains("sk-in-comment"), "{description}");
+        assert!(description.starts_with("Lab profile."), "{description}");
+        assert!(description.contains(REDACTED), "{description}");
+        assert_eq!(catalog.find("broken").unwrap().description, None);
     }
 
     #[test]
