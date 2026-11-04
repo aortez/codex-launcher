@@ -33,8 +33,8 @@ it does not build on Windows.
 cargo install --locked --git https://github.com/aortez/codex-launcher
 ```
 
-From a clone, `cargo install --locked --path .` does the same. Run either
-command again to update. Cargo puts the binary in `~/.cargo/bin`; if that is
+From a clone, `./install.sh` builds and installs it. Run either command again
+to update. Cargo puts the binary in `~/.cargo/bin`; if that is
 not on your `PATH`, add it or link the binary from a directory that is:
 
 ```sh
