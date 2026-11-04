@@ -1,0 +1,5 @@
+# Local Ollama model on this machine.
+model = "qwen3-coder:30b"
+model_provider = "ollama"
+model_reasoning_effort = "medium"
+model_context_window = 65536

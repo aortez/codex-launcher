@@ -1,0 +1,30 @@
+[package]
+name = "codex-launcher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Pick a Codex CLI profile from a terminal menu or the command line, then launch Codex with it."
+license = "MIT"
+repository = "https://github.com/aortez/codex-launcher"
+readme = "README.md"
+keywords = ["codex", "cli", "tui", "launcher"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+anyhow = "=1.0.104"
+clap = { version = "=4.6.7", features = ["derive"] }
+# Paragraph::line_count is unstable; the exact pin keeps it from changing under us.
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
+rustix = { version = "=1.1.6", features = ["process"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+# Keep JSON keys in struct order, including through ctl's parse-and-print round trip.
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+toml_edit = "=0.25.18"
+unicode-width = "=0.2.2"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"

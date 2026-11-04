@@ -1,0 +1,10 @@
+# Team gateway with a key from the environment.
+model = "gpt-team"
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "Team gateway"
+base_url = "https://gateway.example.com/v1"
+env_key = "GATEWAY_API_KEY"
+wire_api = "responses"
+http_headers = { "X-Team-Token" = "sk-test-secret" }
