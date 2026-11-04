@@ -30,8 +30,18 @@ Requires Rust 1.94 or newer. Tested on Linux; it uses Unix sockets and `exec`, s
 it does not build on Windows.
 
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/aortez/codex-launcher
 ```
+
+From a clone, `cargo install --locked --path .` does the same. Run either
+command again to update. Cargo puts the binary in `~/.cargo/bin`; if that is
+not on your `PATH`, add it or link the binary from a directory that is:
+
+```sh
+ln -s ~/.cargo/bin/codex-launcher ~/.local/bin/codex-launcher
+```
+
+`cargo uninstall codex-launcher` removes it; remove any link you made too.
 
 ## Profiles
 
