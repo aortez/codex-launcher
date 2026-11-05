@@ -124,7 +124,11 @@ The picker runs `codex debug models` to get the model's supported levels,
 matching its exact name. Discovery runs on the first `e` or `ctl effort`
 interaction for each profile, and results are reused while the menu is open.
 Model flags and `-c` overrides are included in discovery; prompts and runtime
-subcommands are not. The command has a two-second timeout.
+subcommands are not. The command has a two-second timeout, and batched `ctl`
+keys share a single two-second discovery budget starting when the connection
+arrives. Skipped or timed-out lookups use the fallback choices and can retry on
+the next interaction. Discovery runs in its own process group, which is
+terminated after the query so wrapper subprocesses do not remain running.
 
 Because this diagnostic does not accept `--profile`, named profiles use a
 temporary private config snapshot with the same base/profile table merge.

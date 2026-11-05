@@ -79,6 +79,65 @@ fn codex_catalog_takes_precedence_and_is_queried_once_per_profile() {
 }
 
 #[test]
+fn batched_discovery_shares_a_deadline_and_deferred_profiles_can_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = writable_home();
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\n/bin/sleep 60 &\nwait\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launcher = Headless::start_with_path(home.path(), &[], bin.path());
+    let started = Instant::now();
+    let state = launcher.ctl_json(&["key", "e", "esc", "down", "e", "esc", "down", "e", "esc"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "discovery exceeded the request budget"
+    );
+    assert_eq!(state["selected"], "local");
+    assert_eq!(state["status"], "selecting");
+    assert!(state["effort_picker"].is_null());
+    assert_eq!(launcher.ctl_json(&["state"])["selected"], "local");
+
+    // The last lookup was skipped, not cached as a permanent failure.
+    std::fs::write(&codex, "#!/bin/sh\nprintf '%s' '{\"models\":[{\"slug\":\"qwen3-coder:30b\",\"supported_reasoning_levels\":[{\"effort\":\"high\"}]}]}'\n").unwrap();
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "codex debug models"
+    );
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["high"])
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn short_model_equals_flag_matches_discovered_model() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = writable_home();
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s' '{\"models\":[{\"slug\":\"review-model\",\"supported_reasoning_levels\":[{\"effort\":\"medium\"}]}]}'\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launcher = Headless::start_with_path(home.path(), &["--", "-m=review-model"], bin.path());
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "codex debug models"
+    );
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["medium"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(bin.path().join("codex.args")).unwrap(),
+        "debug\nmodels\n-c\nmodel=\"review-model\"\n"
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
 fn effort_picker_applies_cancels_resets_and_launches() {
     let home = writable_home();
     let base_path = home.path().join("config.toml");

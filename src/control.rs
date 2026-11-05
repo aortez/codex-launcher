@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,9 @@ fn check_private_dir(dir: &Path) -> Result<()> {
 /// A request waiting for the menu loop, with the connection to answer on.
 pub struct Pending {
     pub request: Request,
+    /// Start the discovery budget when the connection arrives, including time
+    /// spent reading the request or waiting for earlier requests.
+    pub received_at: Instant,
     stream: UnixStream,
 }
 
@@ -186,9 +189,14 @@ fn accept_loop(listener: &UnixListener, sender: &Sender<Pending>) {
             thread::sleep(Duration::from_millis(100));
             continue;
         };
+        let received_at = Instant::now();
         match read_request(&stream) {
             Ok(request) => {
-                if let Err(mpsc::SendError(pending)) = sender.send(Pending { request, stream }) {
+                if let Err(mpsc::SendError(pending)) = sender.send(Pending {
+                    request,
+                    received_at,
+                    stream,
+                }) {
                     pending.reply(&error_response("the launcher is exiting"));
                     return;
                 }

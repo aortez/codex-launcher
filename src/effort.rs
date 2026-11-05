@@ -2,6 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ const COMMON_LEVELS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 const MAX_CATALOG_BYTES: u64 = 16 << 20;
-const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Choices {
@@ -26,19 +27,26 @@ pub struct Choices {
 }
 
 impl Choices {
-    /// Query only on demand; the app retains the result for this menu session.
+    /// Query on demand. Return false on timeout so a later action can retry.
     pub fn discover(
         &mut self,
         profile: &Profile,
         codex_home: &Path,
         args: &[String],
         codex: &Path,
-    ) {
-        if let Ok((catalog, model)) = query_catalog(profile, codex_home, args, codex, QUERY_TIMEOUT)
-            && let Some(levels) = catalog_levels(&catalog, &model)
-        {
-            self.levels = levels;
-            self.metadata_source = Some("codex debug models");
+        timeout: Duration,
+    ) -> bool {
+        match query_catalog(profile, codex_home, args, codex, timeout) {
+            Ok((catalog, model)) => {
+                if let Some(levels) = catalog_levels(&catalog, &model) {
+                    self.levels = levels;
+                    self.metadata_source = Some("codex debug models");
+                }
+                true
+            }
+            Err(error) => error
+                .downcast_ref::<std::io::Error>()
+                .is_none_or(|error| error.kind() != std::io::ErrorKind::TimedOut),
         }
     }
 
@@ -142,6 +150,7 @@ fn query_catalog(
     codex: &Path,
     timeout: Duration,
 ) -> Result<(Value, String)> {
+    let deadline = Instant::now() + timeout;
     let config = profile::merged_config(codex_home, profile)?;
     let (config_args, model) = query_arguments(args, config.get("model").and_then(|m| m.as_str()))?;
     // The debug command does not accept --profile. Give it the merged config
@@ -153,6 +162,9 @@ fn query_catalog(
     };
     let query_home = snapshot.as_ref().map_or(codex_home, |dir| dir.path());
     let mut output = tempfile::tempfile()?;
+    if Instant::now() >= deadline {
+        return Err(query_timeout());
+    }
     let mut child = Command::new(codex)
         .args(["debug", "models"])
         .args(config_args)
@@ -160,9 +172,10 @@ fn query_catalog(
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()?;
+    let process_group = rustix::process::Pid::from_child(&child);
     let result = (|| {
-        let deadline = Instant::now() + timeout;
         loop {
             if output.metadata()?.len() > MAX_CATALOG_BYTES {
                 bail!("model catalog is too large");
@@ -182,15 +195,22 @@ fn query_catalog(
                 return Ok((serde_json::from_slice(&bytes)?, model));
             }
             if Instant::now() >= deadline {
-                bail!("codex debug models timed out");
+                return Err(query_timeout());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     })();
-    // Also reap on timeout, oversized output, and I/O failures.
-    let _ = child.kill();
+    // Wrappers may leave descendants behind even after they exit. Terminate
+    // the isolated group on every path, then reap the immediate child.
+    let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
     let _ = child.wait();
     result
+}
+
+fn query_timeout() -> anyhow::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "codex debug models timed out").into()
 }
 
 fn profile_snapshot(codex_home: &Path, config: &str) -> Result<tempfile::TempDir> {
@@ -241,8 +261,11 @@ fn query_arguments(args: &[String], initial_model: Option<&str>) -> Result<(Vec<
             index += 1;
             Some(args.get(index).context("missing model argument")?.as_str())
         } else {
-            arg.strip_prefix("--model=")
-                .or_else(|| arg.strip_prefix("-m").filter(|s| !s.is_empty()))
+            arg.strip_prefix("--model=").or_else(|| {
+                arg.strip_prefix("-m")
+                    .map(|s| s.strip_prefix('=').unwrap_or(s))
+                    .filter(|s| !s.is_empty())
+            })
         };
         if let Some(value) = model_flag {
             model_flag_value = Some(value.to_owned());
@@ -372,7 +395,7 @@ mod tests {
         ] {
             let codex = fake_codex(home.path(), body);
             let mut choices = Choices::load(profile, home.path(), &[]);
-            choices.discover(profile, home.path(), &[], &codex);
+            assert!(choices.discover(profile, home.path(), &[], &codex, QUERY_TIMEOUT));
             assert_eq!(choices.metadata_source, Some("Codex cache"));
             assert_eq!(choices.levels, ["high"]);
         }
@@ -392,6 +415,68 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         let pid = fs::read_to_string(home.path().join("query.pid")).unwrap();
         assert!(!Path::new("/proc").join(pid).exists());
+    }
+
+    #[test]
+    fn discovery_terminates_wrapper_descendants_on_timeout_and_exit() {
+        use rustix::process::{Pid, Signal, kill_process};
+
+        // Kill the known descendant even if an assertion fails, so a
+        // regression does not leave the test's sleeper running.
+        struct Descendant(Pid);
+        impl Drop for Descendant {
+            fn drop(&mut self) {
+                let _ = kill_process(self.0, Signal::KILL);
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model = 'test-model'\n").unwrap();
+        let catalog = profile::load(home.path()).unwrap();
+        let profile = catalog.find("default").unwrap();
+        for ending in ["wait", "printf '{\"models\":[]}'"] {
+            let codex = fake_codex(
+                home.path(),
+                &format!(
+                    "/bin/sleep 60 &\nprintf '%s' \"$!\" > \"$CODEX_HOME/descendant.pid\"\n{ending}"
+                ),
+            );
+            let result = query_catalog(
+                profile,
+                home.path(),
+                &[],
+                &codex,
+                Duration::from_millis(200),
+            );
+            let pid: i32 = fs::read_to_string(home.path().join("descendant.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let descendant = Descendant(Pid::from_raw(pid).unwrap());
+            if ending == "wait" {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            } else {
+                assert!(result.is_ok());
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let status = fs::read_to_string(format!("/proc/{pid}/status"));
+                // The orphan may briefly remain a zombie until its reaper runs.
+                let running = status.is_ok_and(|s| {
+                    !s.lines()
+                        .any(|line| line.starts_with("State:") && line.contains("Z (zombie)"))
+                });
+                if !running {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "discovery descendant {pid} survived cleanup"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(descendant);
+        }
     }
 
     #[test]

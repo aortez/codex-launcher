@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{self, Event};
 
 use crate::app::{Action, App, Instance, Key, Status};
 use crate::control::{self, Pending, Request, Server};
-use crate::ui;
+use crate::{effort, ui};
 
 /// How often the terminal loop checks for control requests between key presses.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -125,6 +125,9 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Leave room within the client's five-second timeout for redrawing and
+    // replying. A batch shares this budget rather than resetting it per key.
+    app.set_discovery_deadline(Some(pending.received_at + effort::QUERY_TIMEOUT));
     let failure = match &pending.request {
         Request::State | Request::Screen => None,
         Request::Key { keys } => match parse_keys(keys) {
@@ -151,6 +154,7 @@ where
             None
         }
     };
+    app.set_discovery_deadline(None);
     let frame = terminal.draw(|frame| ui::draw(frame, app))?;
     let response = match (failure, &pending.request) {
         (Some(error), _) => control::error_response(error),

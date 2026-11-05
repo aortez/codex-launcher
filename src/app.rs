@@ -5,6 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -194,6 +195,7 @@ pub struct App {
     argument_effort: Option<Setting>,
     effort_choices: Vec<Choices>,
     effort_queried: Vec<bool>,
+    discovery_deadline: Option<Instant>,
     codex_path: Option<PathBuf>,
     extra_args: Vec<String>,
     pub effort_picker: Option<EffortPicker>,
@@ -245,6 +247,7 @@ impl App {
             }),
             effort_choices,
             effort_queried,
+            discovery_deadline: None,
             codex_path: crate::launch::find_executable(crate::launch::CODEX, path),
             extra_args: extra_args.to_vec(),
             effort_picker: None,
@@ -296,15 +299,53 @@ impl App {
         if self.effort_queried[self.selected] {
             return;
         }
-        self.effort_queried[self.selected] = true;
+        let timeout = self
+            .discovery_deadline
+            .map_or(effort::QUERY_TIMEOUT, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(effort::QUERY_TIMEOUT)
+            });
+        if timeout.is_zero() {
+            return;
+        }
+        let highlighted = self
+            .effort_picker
+            .as_ref()
+            .and_then(|picker| picker.selected.checked_sub(1))
+            .and_then(|index| self.effort_choices().levels.get(index))
+            .cloned();
         if let Some(codex) = &self.codex_path {
-            self.effort_choices[self.selected].discover(
+            let completed = self.effort_choices[self.selected].discover(
                 &self.catalog.profiles[self.selected],
                 &self.catalog.codex_home,
                 &self.extra_args,
                 codex,
+                timeout,
             );
+            // A request may give this profile less than its normal query
+            // budget. Keep an incomplete lookup eligible for the next action.
+            self.effort_queried[self.selected] = completed;
+            // A timed-out picker may still be open when an Enter key retries
+            // discovery. Preserve its choice by value as the list changes.
+            if let Some(picker) = &mut self.effort_picker {
+                picker.selected = highlighted
+                    .and_then(|value| {
+                        self.effort_choices[self.selected]
+                            .levels
+                            .iter()
+                            .position(|level| level == &value)
+                    })
+                    .map_or(0, |index| index + 1);
+            }
+        } else {
+            self.effort_queried[self.selected] = true;
         }
+    }
+
+    /// Bound all discovery work in one control request, including batched keys.
+    pub fn set_discovery_deadline(&mut self, deadline: Option<Instant>) {
+        self.discovery_deadline = deadline;
     }
 
     pub fn inherit_label(&self) -> String {
@@ -716,6 +757,34 @@ impl<'a> ProfileView<'a> {
 mod tests {
     use super::*;
     use crate::test_support::fixture_app;
+
+    #[test]
+    fn retrying_discovery_updates_an_open_pickers_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, _) = fixture_app();
+        let bin = tempfile::tempdir().unwrap();
+        let codex = bin.path().join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nprintf '%s' '{\"models\":[{\"slug\":\"gpt-base\",\"supported_reasoning_levels\":[{\"effort\":\"high\"}]}]}'\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut app = App::new(
+            profile::load(home.path()).unwrap(),
+            &[],
+            Some(bin.path().as_os_str()),
+            None,
+        );
+        app.set_discovery_deadline(Some(Instant::now()));
+        app.press(Key::Char('e'));
+        app.press(Key::End);
+        assert!(app.effort_picker.as_ref().unwrap().selected > 1);
+        app.set_discovery_deadline(None);
+        app.press(Key::Enter);
+        assert_eq!(app.effort_choices().levels, ["high"]);
+        assert_eq!(app.effort_picker.as_ref().unwrap().selected, 0);
+        assert!(!app.has_effort_override());
+        app.press(Key::Enter);
+        assert!(app.effort_picker.is_none());
+        assert_eq!(app.status(), &Status::Selecting);
+    }
 
     #[test]
     fn parses_key_names() {
