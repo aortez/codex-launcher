@@ -64,6 +64,9 @@ fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
         crate::effort::Control::Toggle => {
             "Thinking on/off from Ollama; no graded effort levels.".to_owned()
         }
+        crate::effort::Control::OffOnly => {
+            "This model does not support thinking. Choose off to override.".to_owned()
+        }
         _ => match choices.metadata_source {
             Some(source) => format!("Levels from {source}."),
             None => "Model support unknown; these are common levels.".to_owned(),

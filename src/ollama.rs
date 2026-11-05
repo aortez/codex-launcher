@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Url, redirect::Policy};
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Key, Table, TableLike};
@@ -31,26 +32,7 @@ pub fn discover(
     deadline: Instant,
 ) -> Result<Option<Choices>> {
     let (config, model) = effective_config(profile, home, args)?;
-    let provider_id = config
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .unwrap_or("openai");
-    let Some(provider) = config
-        .get("model_providers")
-        .and_then(|providers| providers.get(provider_id))
-        .and_then(Item::as_table_like)
-    else {
-        return Ok(None);
-    };
-    // This request only uses the provider's own authentication settings. It
-    // does not borrow Codex's OpenAI login or execute authentication wrappers.
-    if provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true) {
-        return Ok(None);
-    }
-    let Some(base) = provider.get("base_url").and_then(Item::as_str) else {
-        return Ok(None);
-    };
-    let Some(url) = show_url(base) else {
+    let Some((url, headers)) = connection(&config, |key| std::env::var(key).ok())? else {
         return Ok(None);
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -61,31 +43,10 @@ pub fn discover(
         .get_or_init(|| Client::builder().redirect(Policy::none()).build())
         .as_ref()
         .map_err(|_| anyhow::anyhow!("could not initialize metadata HTTP client"))?;
-    let mut request = client.post(url).json(&json!({"model": model}));
-    if let Some(token) = provider
-        .get("experimental_bearer_token")
-        .and_then(Item::as_str)
-    {
-        request = request.bearer_auth(token);
-    } else if let Some(key) = provider.get("env_key").and_then(Item::as_str) {
-        let Ok(token) = std::env::var(key) else {
-            return Ok(None);
-        };
-        request = request.bearer_auth(token);
-    }
-    for (table, from_env) in [("http_headers", false), ("env_http_headers", true)] {
-        if let Some(headers) = provider.get(table).and_then(Item::as_table_like) {
-            for (key, value) in headers.iter() {
-                let value = value.as_str().context("invalid provider header")?;
-                let value = if from_env {
-                    std::env::var(value).context("missing provider header environment variable")?
-                } else {
-                    value.to_owned()
-                };
-                request = request.header(key, value);
-            }
-        }
-    }
+    let request = client
+        .post(url)
+        .headers(headers)
+        .json(&json!({"model": model}));
     // The whole response, including a slowly streamed body, shares the same
     // deadline as Codex discovery and every other key in the control request.
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -109,6 +70,98 @@ pub fn discover(
         bail!("Ollama metadata is too large");
     }
     Ok(choices(&serde_json::from_slice(&bytes)?))
+}
+
+/// Resolve the same provider connection settings Codex uses. Injecting the
+/// environment lookup lets tests cover defaults without changing process env.
+fn connection(
+    config: &DocumentMut,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(Url, HeaderMap)>> {
+    let provider_id = config
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("openai");
+    let provider = config
+        .get("model_providers")
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like);
+    if provider_id == "ollama" {
+        // Codex reserves built-in IDs; a custom table for one is invalid.
+        if provider.is_some() {
+            return Ok(None);
+        }
+        let base = env("CODEX_OSS_BASE_URL").unwrap_or_else(|| {
+            let port = env("CODEX_OSS_PORT")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(11434);
+            format!("http://localhost:{port}/v1")
+        });
+        return Ok(show_url(&base).map(|url| (url, HeaderMap::new())));
+    }
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    // This request only uses the provider's own authentication settings. It
+    // does not borrow Codex's OpenAI login or execute authentication wrappers.
+    if provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true) {
+        return Ok(None);
+    }
+    let Some(base) = provider.get("base_url").and_then(Item::as_str) else {
+        return Ok(None);
+    };
+    let Some(mut url) = show_url(base) else {
+        return Ok(None);
+    };
+    if let Some(params) = provider.get("query_params").and_then(Item::as_table_like) {
+        for (key, value) in params.iter() {
+            url.query_pairs_mut().append_pair(
+                key,
+                value.as_str().context("invalid provider query parameter")?,
+            );
+        }
+    }
+    let mut resolved_headers = HeaderMap::new();
+    for (table, from_env) in [("http_headers", false), ("env_http_headers", true)] {
+        if let Some(headers) = provider.get(table).and_then(Item::as_table_like) {
+            for (key, value) in headers.iter() {
+                let value = value.as_str().context("invalid provider header")?;
+                let value = if from_env {
+                    let Some(value) = env(value).filter(|value| !value.is_empty()) else {
+                        continue;
+                    };
+                    value
+                } else {
+                    value.to_owned()
+                };
+                // HeaderMap replaces existing values case-insensitively;
+                // repeated RequestBuilder::header calls would append them.
+                resolved_headers.insert(
+                    HeaderName::from_bytes(key.as_bytes())?,
+                    HeaderValue::from_str(&value)?,
+                );
+            }
+        }
+    }
+    let token = if let Some(key) = provider.get("env_key").and_then(Item::as_str) {
+        // A configured env_key is required. Missing/empty values must not
+        // silently fall back to an inline token that Codex would not use.
+        let Some(token) = env(key).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        Some(token)
+    } else {
+        provider
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+    };
+    if let Some(token) = token {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))?;
+        authorization.set_sensitive(true);
+        resolved_headers.insert(AUTHORIZATION, authorization);
+    }
+    Ok(Some((url, resolved_headers)))
 }
 
 fn timed_out() -> anyhow::Error {
@@ -193,7 +246,7 @@ fn choices(show: &Value) -> Option<Choices> {
             }
         }
         if values.iter().all(|v| v == false) {
-            (Vec::new(), Control::Unsupported, "Ollama /api/show")
+            (levels, Control::OffOnly, "Ollama /api/show")
         } else if levels.is_empty() {
             // Metadata exists but Codex cannot express these controls.
             (levels, Control::Unsupported, "Ollama /api/show")
@@ -217,7 +270,7 @@ fn choices(show: &Value) -> Option<Choices> {
             return None;
         }
         if !capabilities.iter().any(|v| v == "thinking") {
-            (Vec::new(), Control::Unsupported, "Ollama /api/show")
+            (vec!["none".into()], Control::OffOnly, "Ollama /api/show")
         } else {
             // Older servers (including 0.32.3) report capabilities but no
             // thinking.values. Only infer controls for verified families.
@@ -251,6 +304,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builtin_ollama_defaults_and_overrides_match_codex() {
+        let config: DocumentMut = "model_provider='ollama'".parse().unwrap();
+        for (base, port, expected) in [
+            (None, None, "http://localhost:11434/api/show"),
+            (None, Some("12345"), "http://localhost:12345/api/show"),
+            (
+                Some("http://localhost:54321/proxy/v1"),
+                Some("12345"),
+                "http://localhost:54321/proxy/api/show",
+            ),
+        ] {
+            let (url, headers) = connection(&config, |key| match key {
+                "CODEX_OSS_BASE_URL" => base.map(str::to_owned),
+                "CODEX_OSS_PORT" => port.map(str::to_owned),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(url.as_str(), expected);
+            assert!(headers.is_empty());
+        }
+        let invalid: DocumentMut =
+            "model_provider='ollama'\n[model_providers.ollama]\nbase_url='http://wrong/v1'"
+                .parse()
+                .unwrap();
+        assert!(connection(&invalid, |_| None).unwrap().is_none());
+        let custom: DocumentMut =
+            "model_provider='lab'\n[model_providers.lab]\nbase_url='http://custom/v1'"
+                .parse()
+                .unwrap();
+        let (url, _) = connection(&custom, |_| Some("http://wrong/v1".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(url.as_str(), "http://custom/api/show");
+    }
+
+    #[test]
     fn advertised_controls_take_precedence_over_family_and_capabilities() {
         for (values, levels, control) in [
             (
@@ -264,7 +354,7 @@ mod tests {
                 Control::Toggle,
             ),
             (json!([true]), vec!["medium"], Control::Toggle),
-            (json!([false]), vec![], Control::Unsupported),
+            (json!([false]), vec!["none"], Control::OffOnly),
             (
                 json!([false, "low", "high"]),
                 vec!["none", "low", "high"],
@@ -301,8 +391,8 @@ mod tests {
             &json!({"details":{"family":"qwen3next"}, "capabilities":["completion","tools"]}),
         )
         .unwrap();
-        assert_eq!(nonthinking.control, Control::Unsupported);
-        assert!(nonthinking.levels.is_empty());
+        assert_eq!(nonthinking.control, Control::OffOnly);
+        assert_eq!(nonthinking.levels, ["none"]);
         for data in [
             json!({}),
             json!({"model":"gpt-oss"}),

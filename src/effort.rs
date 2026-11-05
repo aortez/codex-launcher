@@ -25,6 +25,7 @@ pub enum Control {
     Unknown,
     Levels,
     Toggle,
+    OffOnly,
     Unsupported,
 }
 
@@ -132,7 +133,7 @@ impl Choices {
     }
 
     pub fn label(&self, level: &str) -> String {
-        if self.control == Control::Toggle {
+        if matches!(self.control, Control::Toggle | Control::OffOnly) {
             match level {
                 "none" => "Thinking off (none)".to_owned(),
                 "medium" => "Thinking on (medium)".to_owned(),

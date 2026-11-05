@@ -287,18 +287,38 @@ impl Headless {
     }
 
     fn start_with_path(codex_home: &Path, args: &[&str], path: &Path) -> Self {
+        Self::start_with_env(codex_home, args, path, &[])
+    }
+
+    fn start_with_env(
+        codex_home: &Path,
+        args: &[&str],
+        path: &Path,
+        env: &[(&str, Option<&str>)],
+    ) -> Self {
         let runtime = tempfile::tempdir().unwrap();
-        let child = Command::new(BIN)
+        let mut command = Command::new(BIN);
+        command
             .arg("--headless")
             .args(args)
             .env("CODEX_HOME", codex_home)
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("PATH", path)
+            // Existing fixtures include built-in Ollama. Never query a real
+            // local server unless this test supplies its own loopback URL.
+            .env_remove("CODEX_OSS_BASE_URL")
+            .env("CODEX_OSS_PORT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        let child = command.spawn().unwrap();
         let socket = runtime
             .path()
             .join("codex-launcher")
@@ -579,7 +599,8 @@ impl OllamaServer {
                 }
                 let response = match model.as_str() {
                     "toggle" => serde_json::json!({"thinking":{"values":[false,true]}}),
-                    "coder" => serde_json::json!({"capabilities":["completion","tools"],"details":{"family":"qwen3next"}}),
+                    "off" => serde_json::json!({"thinking":{"values":[false]}}),
+                    "coder" | "qwen3-coder:30b" => serde_json::json!({"capabilities":["completion","tools"],"details":{"family":"qwen3next"}}),
                     "unknown" => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"unverified"}}),
                     _ => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"gpt-oss"}}),
                 }.to_string();
@@ -662,11 +683,14 @@ fn ollama_controls_drive_the_picker_commands_and_profile_saves() {
     );
     launcher.ctl_json(&["select", "coder"]);
     let state = launcher.ctl_json(&["key", "e"]);
-    assert_eq!(state["effort_choices"]["control"], "unsupported");
-    assert_eq!(state["effort_choices"]["levels"], serde_json::json!([]));
+    assert_eq!(state["effort_choices"]["control"], "off_only");
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["none"])
+    );
     let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
-    assert!(screen.contains("No effort controls available"), "{screen}");
-    assert!(!screen.contains("s: Save to"), "{screen}");
+    assert!(screen.contains("does not support thinking"), "{screen}");
+    assert!(screen.contains("Thinking off (none)"), "{screen}");
     assert!(!launcher.ctl(&["effort", "high"]).status.success());
     launcher.ctl_json(&["effort", "profile"]);
     for (headers, _) in server.requests.try_iter() {
@@ -755,4 +779,203 @@ fn ollama_fallback_uses_runtime_target_after_codex_has_no_matching_model() {
         "headers belong to the overridden provider"
     );
     launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn nonthinking_models_can_disable_inherited_effort_and_save_or_reset() {
+    let server = OllamaServer::start();
+    for model in ["off", "coder"] {
+        let home = server.home("toggle");
+        std::fs::write(
+            home.path().join("work.config.toml"),
+            format!("model={model:?}\n"),
+        )
+        .unwrap();
+        let launcher = Headless::start_in(home.path(), &[]);
+        let state = launcher.ctl_json(&["select", "work"]);
+        assert_eq!(state["profile"]["effort"]["value"], "high");
+        assert_eq!(state["profile"]["effort"]["source"], "base");
+        let state = launcher.ctl_json(&["key", "e", "end", "enter"]);
+        assert_eq!(state["effort_override"], "none");
+        assert!(
+            state["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "model_reasoning_effort=\"none\"")
+        );
+        let state = launcher.ctl_json(&["effort", "profile"]);
+        assert_eq!(state["profile"]["effort"]["value"], "high");
+        assert!(state["effort_override"].is_null());
+        launcher.ctl_json(&["effort", "none"]);
+        assert!(!launcher.ctl(&["effort", "medium"]).status.success());
+        assert_eq!(launcher.ctl_json(&["state"])["effort_override"], "none");
+        let state = launcher.ctl_json(&["save-effort"]);
+        assert_eq!(state["profile"]["effort"]["value"], "none");
+        assert_eq!(state["profile"]["effort"]["source"], "profile");
+        assert!(
+            std::fs::read_to_string(home.path().join("work.config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort = \"none\"")
+        );
+        assert!(
+            std::fs::read_to_string(home.path().join("config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort='high'")
+        );
+        launcher.ctl_json(&["quit"]);
+    }
+}
+
+fn header_values<'a>(headers: &'a str, name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+        .collect()
+}
+
+#[test]
+fn ollama_headers_and_bearer_tokens_follow_codex_precedence() {
+    let server = OllamaServer::start();
+    for (env_key, inline_token, env_value, expected) in [
+        (true, true, Some("env-token"), Some("Bearer env-token")),
+        (true, true, None, None),
+        (true, true, Some(""), None),
+        (false, true, None, Some("Bearer inline-token")),
+        (false, false, None, Some("Bearer header-token")),
+    ] {
+        let home = server.home("toggle");
+        let config = home.path().join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap().replace("http_headers={ X-Test='header-secret' }", "http_headers={ X-Test='static', X-Keep='keep-static', X-Empty='keep-empty', Authorization='Bearer static-token' }");
+        text.push_str("env_http_headers={ x-test='EFFORT_TEST_HEADER', X-Keep='EFFORT_TEST_ABSENT', X-Empty='EFFORT_TEST_EMPTY', X-Missing='EFFORT_TEST_ABSENT', authorization='EFFORT_TEST_AUTH' }\n");
+        if env_key {
+            text.push_str("env_key='EFFORT_TEST_TOKEN'\n");
+        }
+        if inline_token {
+            text.push_str("experimental_bearer_token='inline-token'\n");
+        }
+        std::fs::write(config, text).unwrap();
+        let launcher = Headless::start_with_env(
+            home.path(),
+            &[],
+            Path::new("/nonexistent"),
+            &[
+                ("EFFORT_TEST_HEADER", Some("env-header")),
+                ("EFFORT_TEST_ABSENT", None),
+                ("EFFORT_TEST_EMPTY", Some("")),
+                ("EFFORT_TEST_AUTH", Some("Bearer header-token")),
+                ("EFFORT_TEST_TOKEN", env_value),
+            ],
+        );
+        let state = launcher.ctl_json(&["key", "e"]);
+        if let Some(expected) = expected {
+            assert_eq!(state["effort_choices"]["control"], "toggle");
+            let (headers, _) = server
+                .requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(header_values(&headers, "X-Test"), ["env-header"]);
+            assert_eq!(header_values(&headers, "X-Keep"), ["keep-static"]);
+            assert_eq!(header_values(&headers, "X-Empty"), ["keep-empty"]);
+            assert!(header_values(&headers, "X-Missing").is_empty());
+            assert_eq!(header_values(&headers, "Authorization"), [expected]);
+        } else {
+            assert_eq!(state["effort_choices"]["control"], "unknown");
+            assert!(
+                server.requests.try_recv().is_err(),
+                "must not use the inline token when env_key is missing/empty"
+            );
+        }
+        launcher.ctl_json(&["quit"]);
+    }
+}
+
+#[test]
+fn ollama_query_parameters_keep_profile_and_runtime_overrides() {
+    let server = OllamaServer::start();
+    let home = server.home("toggle");
+    let config = home.path().join("config.toml");
+    let mut base = std::fs::read_to_string(&config).unwrap();
+    base.push_str(
+        "query_params={ route='base', token='query-secret', api-version='2026-01-01' }\n",
+    );
+    std::fs::write(&config, base).unwrap();
+    std::fs::write(
+        home.path().join("work.config.toml"),
+        "[model_providers.lab]\nquery_params={ route='profile' }\n",
+    )
+    .unwrap();
+    let launcher = Headless::start_in(
+        home.path(),
+        &[
+            "--",
+            "-c",
+            "model_providers.lab.query_params.route='runtime / qa&x=1+#%'",
+        ],
+    );
+    launcher.ctl_json(&["select", "work"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let (headers, _) = server
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let path = headers
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+    assert_eq!(url.path(), "/proxy/api/show");
+    let params: std::collections::BTreeMap<_, _> = url.query_pairs().collect();
+    assert_eq!(params.len(), 3);
+    assert_eq!(params["route"], "runtime / qa&x=1+#%");
+    assert_eq!(params["token"], "query-secret");
+    assert_eq!(params["api-version"], "2026-01-01");
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn builtin_ollama_fixture_uses_base_url_or_port_without_a_provider_table() {
+    let server = OllamaServer::start();
+    let port = reqwest::Url::parse(&server.base_url)
+        .unwrap()
+        .port()
+        .unwrap()
+        .to_string();
+    for (base, port, expected_path) in [
+        (Some(server.base_url.as_str()), "1", "/proxy/api/show"),
+        (None, port.as_str(), "/api/show"),
+    ] {
+        let home = writable_home();
+        let launcher = Headless::start_with_env(
+            home.path(),
+            &[],
+            Path::new("/nonexistent"),
+            &[("CODEX_OSS_BASE_URL", base), ("CODEX_OSS_PORT", Some(port))],
+        );
+        launcher.ctl_json(&["select", "local"]);
+        let state = launcher.ctl_json(&["effort", "none"]);
+        assert_eq!(
+            state["effort_choices"]["metadata_source"],
+            "Ollama /api/show"
+        );
+        assert_eq!(state["effort_choices"]["control"], "off_only");
+        let (headers, body) = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            headers.starts_with(&format!("POST {expected_path} HTTP/1.1")),
+            "{headers}"
+        );
+        assert_eq!(body["model"], "qwen3-coder:30b");
+        assert!(header_values(&headers, "Authorization").is_empty());
+        launcher.ctl_json(&["quit"]);
+    }
 }
