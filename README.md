@@ -5,24 +5,9 @@ profile and launching Codex with it. You can also list, inspect, and launch
 profiles from the command line, and another program can read and drive a
 running menu through `codex-launcher ctl`.
 
-```
-┌ Profiles ──┐┌ gateway ─────────────────────────────────────────────────────┐
-│  default   ││Team gateway with a key from the environment.                 │
-│> gateway   ││                                                              │
-│  local     ││model     gpt-team                                            │
-│            ││provider  gateway (Team gateway)                              │
-│            ││url       https://gateway.example.com/v1                      │
-│            ││effort    high  (base)                                        │
-│            ││sandbox   workspace-write  (base)                             │
-│            ││approval  on-request  (base)                                  │
-│            ││launch    codex --profile gateway                             │
-│            ││                                                              │
-│            ││── gateway.config.toml ──                                     │
-│            ││# Team gateway with a key from the environment.               │
-│            ││model = "gpt-team"                                            │
-└────────────┘└────────────────────────────────────────────────── 1-13 of 21 ┘
-↑/↓ move · e effort · Enter launch · PgUp/PgDn scroll · q quit
-```
+![codex-launcher showing sample profiles, inherited effort, and redacted configuration](docs/images/launcher.png)
+
+*The menu running with the repository’s sample profiles.*
 
 ## Install
 
