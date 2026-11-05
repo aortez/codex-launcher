@@ -135,9 +135,45 @@ temporary private config snapshot with the same base/profile table merge.
 This keeps profile credentials out of process arguments. The snapshot is
 removed after the query; the original config files stay in place.
 
-If the command is missing, fails, or has no matching model, the picker falls
-back to `model_catalog_json` (relative to `CODEX_HOME`) or the built-in OpenAI
-provider's `models_cache.json`. Without matching metadata, it offers common
+If the command is missing, fails, or has no matching model, the launcher also
+checks the configured provider's Ollama `/api/show` endpoint. This uses the
+merged profile and runtime model/provider overrides. Built-in
+`model_provider = "ollama"` works without a provider table: it uses
+`CODEX_OSS_BASE_URL`, or `http://localhost:<port>/v1` with `CODEX_OSS_PORT`
+(default `11434`). Custom providers use their configured `base_url`.
+The base URL must end in `/v1` (an optional trailing slash is fine); a reverse
+proxy's path prefix is preserved.
+
+Discovery includes provider `query_params` with URL encoding. Static headers
+are replaced case-insensitively by `env_http_headers` when the environment
+variable exists and is nonempty; missing or empty optional variables are
+skipped. Authentication prefers `env_key` over `experimental_bearer_token`
+and replaces any configured Authorization header. If a configured `env_key`
+is missing or empty, discovery keeps the fallback choices instead of using
+the inline token. Redirects are refused and OpenAI-login providers are skipped.
+Base URLs with embedded credentials, query strings, or fragments are skipped;
+use `query_params` for query values. No model is loaded or inference requested
+during discovery. HTTP and Codex discovery share the same two-second budget,
+including response bodies.
+
+Ollama's advertised `thinking.values` determine the controls where available:
+
+- Named levels appear as effort choices, limited to values Codex can pass.
+- Boolean controls appear as **Thinking off (none)** and **Thinking on (medium)**.
+  These are on/off controls; `medium` is the compatibility value sent to Codex.
+- Models without thinking support offer **Thinking off (none)**, so an
+  incompatible inherited effort can be overridden for this launch or saved.
+  The inherited setting remains available as a separate choice.
+
+Older Ollama servers may omit `thinking.values`. For those, `capabilities` and
+the model family identify GPT-OSS's low/medium/high controls, Qwen3.5/3.6 MoE
+(`qwen35moe`) and GLM-4.7-Flash (`glm4moelite`) on/off controls, and models
+without thinking. These inferred controls are identified as `Ollama model
+family` in state. Unrecognized thinking families remain unverified.
+
+If neither discovery source has matching metadata, the picker falls back to
+`model_catalog_json` (relative to `CODEX_HOME`) or the built-in OpenAI provider's
+`models_cache.json`. Without matching metadata, it offers common
 levels and labels model support as unknown; the provider may reject unsupported
 choices. Additional runtime `--profile`, `--oss`, and `--local-provider`
 arguments use this unverified fallback. Wrappers must forward the generated
@@ -173,9 +209,12 @@ it always matches the screen.
 
 `ctl state` reports the effective effort in `profile.effort` and each menu
 entry. `effort_override` is the selected profile's temporary choice, or null;
-`effort_choices` includes the available levels and their metadata source
-(null when support is unknown). `effort_picker` reports the open picker's
-selected index, where zero means inheritance, or null when closed. `notice`
+`effort_choices` includes the available levels, their metadata source
+(null when support is unknown), and `control` (`levels`, `toggle`, `off_only`,
+`unsupported`, or `unknown`). Toggle levels remain `none` and `medium` in `ctl`
+commands and saved config; `off_only` permits only `none`. `unsupported` means
+no advertised control can be expressed through Codex. `effort_picker` reports
+the open picker's selected index, where zero means inheritance, or null when closed. `notice`
 contains save feedback or a keyboard-action error, when present. Invalid
 `ctl effort` values fail without changing the current choice.
 

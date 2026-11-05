@@ -287,18 +287,38 @@ impl Headless {
     }
 
     fn start_with_path(codex_home: &Path, args: &[&str], path: &Path) -> Self {
+        Self::start_with_env(codex_home, args, path, &[])
+    }
+
+    fn start_with_env(
+        codex_home: &Path,
+        args: &[&str],
+        path: &Path,
+        env: &[(&str, Option<&str>)],
+    ) -> Self {
         let runtime = tempfile::tempdir().unwrap();
-        let child = Command::new(BIN)
+        let mut command = Command::new(BIN);
+        command
             .arg("--headless")
             .args(args)
             .env("CODEX_HOME", codex_home)
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("PATH", path)
+            // Existing fixtures include built-in Ollama. Never query a real
+            // local server unless this test supplies its own loopback URL.
+            .env_remove("CODEX_OSS_BASE_URL")
+            .env("CODEX_OSS_PORT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        let child = command.spawn().unwrap();
         let socket = runtime
             .path()
             .join("codex-launcher")
@@ -491,4 +511,471 @@ fn direct_launch_dry_run_and_listing() {
 
     let output = run(&["nope"]);
     assert!(!output.status.success());
+}
+
+/// A local HTTP fixture, with bounded waits and cleanup even on failed assertions.
+struct OllamaServer {
+    base_url: String,
+    requests: std::sync::mpsc::Receiver<(String, Value)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OllamaServer {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/proxy/v1", listener.local_addr().unwrap());
+        let (tx, requests) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut slow_seen = false;
+            while !stopping.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let model = request["model"].as_str().unwrap().to_owned();
+                tx.send((headers, request)).unwrap();
+                if model == "redirect" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                if model == "oversized" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                if model == "slow" && !slow_seen {
+                    slow_seen = true;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\n").unwrap();
+                    while !stopping.load(Ordering::Relaxed) {
+                        if stream.write_all(b" ").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    continue;
+                }
+                let response = match model.as_str() {
+                    "toggle" => serde_json::json!({"thinking":{"values":[false,true]}}),
+                    "off" => serde_json::json!({"thinking":{"values":[false]}}),
+                    "coder" | "qwen3-coder:30b" => serde_json::json!({"capabilities":["completion","tools"],"details":{"family":"qwen3next"}}),
+                    "unknown" => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"unverified"}}),
+                    _ => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"gpt-oss"}}),
+                }.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+            }
+        });
+        Self {
+            base_url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn home(&self, model: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), format!("model={model:?}\nmodel_provider='lab'\nmodel_reasoning_effort='high'\n[model_providers.lab]\nname='Local server'\nbase_url={:?}\nhttp_headers={{ X-Test='header-secret' }}\n", self.base_url)).unwrap();
+        home
+    }
+}
+
+impl Drop for OllamaServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn ollama_controls_drive_the_picker_commands_and_profile_saves() {
+    let server = OllamaServer::start();
+    let home = server.home("custom-oss-alias");
+    for (name, model) in [("toggle", "toggle"), ("coder", "coder")] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            format!("model={model:?}\n"),
+        )
+        .unwrap();
+    }
+    // No Codex executable: server metadata still works.
+    let launcher = Headless::start_in(home.path(), &[]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["low", "medium", "high"])
+    );
+    assert_eq!(state["effort_choices"]["control"], "levels");
+    assert!(!launcher.ctl(&["effort", "ultra"]).status.success());
+    launcher.ctl_json(&["key", "esc", "e", "esc"]);
+    assert_eq!(
+        server.requests.try_iter().count(),
+        1,
+        "discovery should be cached"
+    );
+    launcher.ctl_json(&["select", "toggle"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(
+        screen.contains("Thinking off (none)") && screen.contains("Thinking on (medium)"),
+        "{screen}"
+    );
+    let state = launcher.ctl_json(&["effort", "none"]);
+    assert!(
+        state["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "model_reasoning_effort=\"none\"")
+    );
+    launcher.ctl_json(&["save-effort"]);
+    assert!(
+        std::fs::read_to_string(home.path().join("toggle.config.toml"))
+            .unwrap()
+            .contains("model_reasoning_effort = \"none\"")
+    );
+    launcher.ctl_json(&["select", "coder"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "off_only");
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["none"])
+    );
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(screen.contains("does not support thinking"), "{screen}");
+    assert!(screen.contains("Thinking off (none)"), "{screen}");
+    assert!(!launcher.ctl(&["effort", "high"]).status.success());
+    launcher.ctl_json(&["effort", "profile"]);
+    for (headers, _) in server.requests.try_iter() {
+        assert!(
+            headers.starts_with("POST /proxy/api/show HTTP/1.1"),
+            "{headers}"
+        );
+        assert!(headers.contains("x-test: header-secret"), "{headers}");
+    }
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn ollama_slow_body_shares_batch_deadline_and_can_retry() {
+    let server = OllamaServer::start();
+    let home = server.home("slow");
+    for name in ["a", "b"] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            "model='toggle'\n",
+        )
+        .unwrap();
+    }
+    let launcher = Headless::start_in(home.path(), &[]);
+    let started = Instant::now();
+    let state = launcher.ctl_json(&["key", "e", "esc", "down", "e", "esc", "down", "e", "esc"]);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(state["selected"], "b");
+    launcher.ctl_json(&["select", "default"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "Ollama model family"
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn ollama_unverified_redirected_and_oversized_responses_remain_unknown() {
+    let server = OllamaServer::start();
+    for model in ["unknown", "redirect", "oversized"] {
+        let home = server.home(model);
+        let launcher = Headless::start_in(home.path(), &[]);
+        let state = launcher.ctl_json(&["key", "e"]);
+        assert!(state["effort_choices"]["metadata_source"].is_null());
+        assert_eq!(state["effort_choices"]["control"], "unknown");
+        launcher.ctl_json(&["quit"]);
+        assert_eq!(server.requests.try_iter().count(), 1);
+    }
+}
+
+#[test]
+fn ollama_fallback_uses_runtime_target_after_codex_has_no_matching_model() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = OllamaServer::start();
+    let home = server.home("wrong-model");
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\nprintf '{\"models\":[]}'\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        "model_providers.runtime={{name='Runtime',base_url={:?}}}",
+        server.base_url
+    );
+    let launcher = Headless::start_with_path(
+        home.path(),
+        &[
+            "--",
+            "-m=toggle",
+            "-c",
+            "model_provider='runtime'",
+            "-c",
+            &config,
+        ],
+        bin.path(),
+    );
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let (headers, body) = server
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(body["model"], "toggle");
+    assert!(
+        !headers.contains("header-secret"),
+        "headers belong to the overridden provider"
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn nonthinking_models_can_disable_inherited_effort_and_save_or_reset() {
+    let server = OllamaServer::start();
+    for model in ["off", "coder"] {
+        let home = server.home("toggle");
+        std::fs::write(
+            home.path().join("work.config.toml"),
+            format!("model={model:?}\n"),
+        )
+        .unwrap();
+        let launcher = Headless::start_in(home.path(), &[]);
+        let state = launcher.ctl_json(&["select", "work"]);
+        assert_eq!(state["profile"]["effort"]["value"], "high");
+        assert_eq!(state["profile"]["effort"]["source"], "base");
+        let state = launcher.ctl_json(&["key", "e", "end", "enter"]);
+        assert_eq!(state["effort_override"], "none");
+        assert!(
+            state["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "model_reasoning_effort=\"none\"")
+        );
+        let state = launcher.ctl_json(&["effort", "profile"]);
+        assert_eq!(state["profile"]["effort"]["value"], "high");
+        assert!(state["effort_override"].is_null());
+        launcher.ctl_json(&["effort", "none"]);
+        assert!(!launcher.ctl(&["effort", "medium"]).status.success());
+        assert_eq!(launcher.ctl_json(&["state"])["effort_override"], "none");
+        let state = launcher.ctl_json(&["save-effort"]);
+        assert_eq!(state["profile"]["effort"]["value"], "none");
+        assert_eq!(state["profile"]["effort"]["source"], "profile");
+        assert!(
+            std::fs::read_to_string(home.path().join("work.config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort = \"none\"")
+        );
+        assert!(
+            std::fs::read_to_string(home.path().join("config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort='high'")
+        );
+        launcher.ctl_json(&["quit"]);
+    }
+}
+
+fn header_values<'a>(headers: &'a str, name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+        .collect()
+}
+
+#[test]
+fn ollama_headers_and_bearer_tokens_follow_codex_precedence() {
+    let server = OllamaServer::start();
+    for (env_key, inline_token, env_value, expected) in [
+        (true, true, Some("env-token"), Some("Bearer env-token")),
+        (true, true, None, None),
+        (true, true, Some(""), None),
+        (false, true, None, Some("Bearer inline-token")),
+        (false, false, None, Some("Bearer header-token")),
+    ] {
+        let home = server.home("toggle");
+        let config = home.path().join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap().replace("http_headers={ X-Test='header-secret' }", "http_headers={ X-Test='static', X-Keep='keep-static', X-Empty='keep-empty', Authorization='Bearer static-token' }");
+        text.push_str("env_http_headers={ x-test='EFFORT_TEST_HEADER', X-Keep='EFFORT_TEST_ABSENT', X-Empty='EFFORT_TEST_EMPTY', X-Missing='EFFORT_TEST_ABSENT', authorization='EFFORT_TEST_AUTH' }\n");
+        if env_key {
+            text.push_str("env_key='EFFORT_TEST_TOKEN'\n");
+        }
+        if inline_token {
+            text.push_str("experimental_bearer_token='inline-token'\n");
+        }
+        std::fs::write(config, text).unwrap();
+        let launcher = Headless::start_with_env(
+            home.path(),
+            &[],
+            Path::new("/nonexistent"),
+            &[
+                ("EFFORT_TEST_HEADER", Some("env-header")),
+                ("EFFORT_TEST_ABSENT", None),
+                ("EFFORT_TEST_EMPTY", Some("")),
+                ("EFFORT_TEST_AUTH", Some("Bearer header-token")),
+                ("EFFORT_TEST_TOKEN", env_value),
+            ],
+        );
+        let state = launcher.ctl_json(&["key", "e"]);
+        if let Some(expected) = expected {
+            assert_eq!(state["effort_choices"]["control"], "toggle");
+            let (headers, _) = server
+                .requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(header_values(&headers, "X-Test"), ["env-header"]);
+            assert_eq!(header_values(&headers, "X-Keep"), ["keep-static"]);
+            assert_eq!(header_values(&headers, "X-Empty"), ["keep-empty"]);
+            assert!(header_values(&headers, "X-Missing").is_empty());
+            assert_eq!(header_values(&headers, "Authorization"), [expected]);
+        } else {
+            assert_eq!(state["effort_choices"]["control"], "unknown");
+            assert!(
+                server.requests.try_recv().is_err(),
+                "must not use the inline token when env_key is missing/empty"
+            );
+        }
+        launcher.ctl_json(&["quit"]);
+    }
+}
+
+#[test]
+fn ollama_query_parameters_keep_profile_and_runtime_overrides() {
+    let server = OllamaServer::start();
+    let home = server.home("toggle");
+    let config = home.path().join("config.toml");
+    let mut base = std::fs::read_to_string(&config).unwrap();
+    base.push_str(
+        "query_params={ route='base', token='query-secret', api-version='2026-01-01' }\n",
+    );
+    std::fs::write(&config, base).unwrap();
+    std::fs::write(
+        home.path().join("work.config.toml"),
+        "[model_providers.lab]\nquery_params={ route='profile' }\n",
+    )
+    .unwrap();
+    let launcher = Headless::start_in(
+        home.path(),
+        &[
+            "--",
+            "-c",
+            "model_providers.lab.query_params.route='runtime / qa&x=1+#%'",
+        ],
+    );
+    launcher.ctl_json(&["select", "work"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let (headers, _) = server
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let path = headers
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+    assert_eq!(url.path(), "/proxy/api/show");
+    let params: std::collections::BTreeMap<_, _> = url.query_pairs().collect();
+    assert_eq!(params.len(), 3);
+    assert_eq!(params["route"], "runtime / qa&x=1+#%");
+    assert_eq!(params["token"], "query-secret");
+    assert_eq!(params["api-version"], "2026-01-01");
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn builtin_ollama_fixture_uses_base_url_or_port_without_a_provider_table() {
+    let server = OllamaServer::start();
+    let port = reqwest::Url::parse(&server.base_url)
+        .unwrap()
+        .port()
+        .unwrap()
+        .to_string();
+    for (base, port, expected_path) in [
+        (Some(server.base_url.as_str()), "1", "/proxy/api/show"),
+        (None, port.as_str(), "/api/show"),
+    ] {
+        let home = writable_home();
+        let launcher = Headless::start_with_env(
+            home.path(),
+            &[],
+            Path::new("/nonexistent"),
+            &[("CODEX_OSS_BASE_URL", base), ("CODEX_OSS_PORT", Some(port))],
+        );
+        launcher.ctl_json(&["select", "local"]);
+        let state = launcher.ctl_json(&["effort", "none"]);
+        assert_eq!(
+            state["effort_choices"]["metadata_source"],
+            "Ollama /api/show"
+        );
+        assert_eq!(state["effort_choices"]["control"], "off_only");
+        let (headers, body) = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            headers.starts_with(&format!("POST {expected_path} HTTP/1.1")),
+            "{headers}"
+        );
+        assert_eq!(body["model"], "qwen3-coder:30b");
+        assert!(header_values(&headers, "Authorization").is_empty());
+        launcher.ctl_json(&["quit"]);
+    }
 }

@@ -315,31 +315,27 @@ impl App {
             .and_then(|picker| picker.selected.checked_sub(1))
             .and_then(|index| self.effort_choices().levels.get(index))
             .cloned();
-        if let Some(codex) = &self.codex_path {
-            let completed = self.effort_choices[self.selected].discover(
-                &self.catalog.profiles[self.selected],
-                &self.catalog.codex_home,
-                &self.extra_args,
-                codex,
-                timeout,
-            );
-            // A request may give this profile less than its normal query
-            // budget. Keep an incomplete lookup eligible for the next action.
-            self.effort_queried[self.selected] = completed;
-            // A timed-out picker may still be open when an Enter key retries
-            // discovery. Preserve its choice by value as the list changes.
-            if let Some(picker) = &mut self.effort_picker {
-                picker.selected = highlighted
-                    .and_then(|value| {
-                        self.effort_choices[self.selected]
-                            .levels
-                            .iter()
-                            .position(|level| level == &value)
-                    })
-                    .map_or(0, |index| index + 1);
-            }
-        } else {
-            self.effort_queried[self.selected] = true;
+        let completed = self.effort_choices[self.selected].discover(
+            &self.catalog.profiles[self.selected],
+            &self.catalog.codex_home,
+            &self.extra_args,
+            self.codex_path.as_deref(),
+            timeout,
+        );
+        // A request may give this profile less than its normal query
+        // budget. Keep an incomplete lookup eligible for the next action.
+        self.effort_queried[self.selected] = completed;
+        // A timed-out picker may still be open when an Enter key retries
+        // discovery. Preserve its choice by value as the list changes.
+        if let Some(picker) = &mut self.effort_picker {
+            picker.selected = highlighted
+                .and_then(|value| {
+                    self.effort_choices[self.selected]
+                        .levels
+                        .iter()
+                        .position(|level| level == &value)
+                })
+                .map_or(0, |index| index + 1);
         }
     }
 

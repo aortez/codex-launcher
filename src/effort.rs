@@ -19,11 +19,22 @@ const COMMON_LEVELS: &[&str] = &[
 const MAX_CATALOG_BYTES: u64 = 16 << 20;
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Control {
+    Unknown,
+    Levels,
+    Toggle,
+    OffOnly,
+    Unsupported,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Choices {
     pub levels: Vec<String>,
     /// None means these are common values, not verified model capabilities.
     pub metadata_source: Option<&'static str>,
+    pub control: Control,
 }
 
 impl Choices {
@@ -33,20 +44,35 @@ impl Choices {
         profile: &Profile,
         codex_home: &Path,
         args: &[String],
-        codex: &Path,
+        codex: Option<&Path>,
         timeout: Duration,
     ) -> bool {
-        match query_catalog(profile, codex_home, args, codex, timeout) {
-            Ok((catalog, model)) => {
-                if let Some(levels) = catalog_levels(&catalog, &model) {
-                    self.levels = levels;
-                    self.metadata_source = Some("codex debug models");
+        let deadline = Instant::now() + timeout;
+        if let Some(codex) = codex {
+            match query_catalog(profile, codex_home, args, codex, timeout) {
+                Ok((catalog, model)) => {
+                    if let Some(levels) = catalog_levels(&catalog, &model) {
+                        self.control = if levels.is_empty() {
+                            Control::Unsupported
+                        } else {
+                            Control::Levels
+                        };
+                        self.levels = levels;
+                        self.metadata_source = Some("codex debug models");
+                        return true;
+                    }
                 }
+                Err(error) if is_timeout(&error) => return false,
+                Err(_) => {}
+            }
+        }
+        match crate::ollama::discover(profile, codex_home, args, deadline) {
+            Ok(Some(choices)) => {
+                *self = choices;
                 true
             }
-            Err(error) => error
-                .downcast_ref::<std::io::Error>()
-                .is_none_or(|error| error.kind() != std::io::ErrorKind::TimedOut),
+            Ok(None) => true,
+            Err(error) => !is_timeout(&error),
         }
     }
 
@@ -82,6 +108,11 @@ impl Choices {
                 && let Some(levels) = read_levels(&path, model)
             {
                 return Self {
+                    control: if levels.is_empty() {
+                        Control::Unsupported
+                    } else {
+                        Control::Levels
+                    },
                     levels,
                     metadata_source: Some(source),
                 };
@@ -97,8 +128,30 @@ impl Choices {
         Self {
             levels,
             metadata_source: None,
+            control: Control::Unknown,
         }
     }
+
+    pub fn label(&self, level: &str) -> String {
+        if matches!(self.control, Control::Toggle | Control::OffOnly) {
+            match level {
+                "none" => "Thinking off (none)".to_owned(),
+                "medium" => "Thinking on (medium)".to_owned(),
+                _ => level.to_owned(),
+            }
+        } else {
+            level.to_owned()
+        }
+    }
+}
+
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        || error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
 }
 
 fn valid_level(level: &str) -> bool {
@@ -240,7 +293,10 @@ fn profile_snapshot(codex_home: &Path, config: &str) -> Result<tempfile::TempDir
 
 /// Forward config overrides, never the runtime subcommand or prompt. Model
 /// flags are runtime-only too, but their equivalent config key works here.
-fn query_arguments(args: &[String], initial_model: Option<&str>) -> Result<(Vec<String>, String)> {
+pub(crate) fn query_arguments(
+    args: &[String],
+    initial_model: Option<&str>,
+) -> Result<(Vec<String>, String)> {
     let mut model = initial_model.map(str::to_owned);
     let mut model_flag_value = None;
     let mut forwarded = Vec::new();
@@ -395,7 +451,7 @@ mod tests {
         ] {
             let codex = fake_codex(home.path(), body);
             let mut choices = Choices::load(profile, home.path(), &[]);
-            assert!(choices.discover(profile, home.path(), &[], &codex, QUERY_TIMEOUT));
+            assert!(choices.discover(profile, home.path(), &[], Some(&codex), QUERY_TIMEOUT));
             assert_eq!(choices.metadata_source, Some("Codex cache"));
             assert_eq!(choices.levels, ["high"]);
         }
