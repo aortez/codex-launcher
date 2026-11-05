@@ -10,8 +10,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use serde::Serialize;
 
+use crate::effort::{self, Choices};
 use crate::launch::Command;
-use crate::profile::{Catalog, Profile, Provider, Setting};
+use crate::profile::{self, Catalog, Profile, Provider, Setting, Source};
 
 /// A key press, from the terminal or from `ctl key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +133,8 @@ pub enum Action {
     Last,
     ScrollUp,
     ScrollDown,
+    EditEffort,
+    SaveEffort,
     Launch,
     Quit,
 }
@@ -145,6 +148,8 @@ pub fn action_for(key: Key) -> Option<Action> {
         Key::End | Key::Char('G') => Action::Last,
         Key::PageUp => Action::ScrollUp,
         Key::PageDown => Action::ScrollDown,
+        Key::Char('e') => Action::EditEffort,
+        Key::Char('s') => Action::SaveEffort,
         Key::Enter => Action::Launch,
         Key::Esc | Key::Char('q') | Key::Ctrl('c') => Action::Quit,
         _ => return None,
@@ -183,13 +188,27 @@ pub struct View {
 /// The launcher menu state.
 pub struct App {
     catalog: Catalog,
+    base_commands: Vec<Command>,
     commands: Vec<Command>,
+    effort_overrides: Vec<Option<Setting>>,
+    argument_effort: Option<Setting>,
+    effort_choices: Vec<Choices>,
+    effort_queried: Vec<bool>,
+    codex_path: Option<PathBuf>,
+    extra_args: Vec<String>,
+    pub effort_picker: Option<EffortPicker>,
     selected: usize,
     status: Status,
     home: Option<PathBuf>,
     /// A one-line warning shown in the footer.
     pub notice: Option<String>,
     pub view: View,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EffortPicker {
+    /// Zero is inheritance; subsequent entries index the available levels.
+    pub selected: usize,
 }
 
 impl App {
@@ -203,14 +222,32 @@ impl App {
         path: Option<&OsStr>,
         home: Option<PathBuf>,
     ) -> Self {
-        let commands = catalog
+        let commands: Vec<_> = catalog
             .profiles
             .iter()
             .map(|profile| Command::for_profile(profile, extra_args, path))
             .collect();
+        let effort_choices = catalog
+            .profiles
+            .iter()
+            .map(|profile| Choices::load(profile, &catalog.codex_home, extra_args))
+            .collect();
+        let effort_overrides = vec![None; catalog.profiles.len()];
+        let effort_queried = vec![false; catalog.profiles.len()];
         Self {
             catalog,
+            base_commands: commands.clone(),
             commands,
+            effort_overrides,
+            argument_effort: effort::argument_effort(extra_args).map(|value| Setting {
+                value,
+                source: Source::Arguments,
+            }),
+            effort_choices,
+            effort_queried,
+            codex_path: crate::launch::find_executable(crate::launch::CODEX, path),
+            extra_args: extra_args.to_vec(),
+            effort_picker: None,
             selected: 0,
             status: Status::Selecting,
             home,
@@ -236,6 +273,182 @@ impl App {
         &self.commands[self.selected]
     }
 
+    pub fn effective_effort(&self) -> Option<&Setting> {
+        self.effort_at(self.selected)
+    }
+
+    fn effort_at(&self, index: usize) -> Option<&Setting> {
+        self.effort_overrides[index]
+            .as_ref()
+            .or(self.argument_effort.as_ref())
+            .or(self.catalog.profiles[index].effort.as_ref())
+    }
+
+    pub fn effort_choices(&self) -> &Choices {
+        &self.effort_choices[self.selected]
+    }
+
+    pub fn has_effort_override(&self) -> bool {
+        self.effort_overrides[self.selected].is_some()
+    }
+
+    fn discover_effort(&mut self) {
+        if self.effort_queried[self.selected] {
+            return;
+        }
+        self.effort_queried[self.selected] = true;
+        if let Some(codex) = &self.codex_path {
+            self.effort_choices[self.selected].discover(
+                &self.catalog.profiles[self.selected],
+                &self.catalog.codex_home,
+                &self.extra_args,
+                codex,
+            );
+        }
+    }
+
+    pub fn inherit_label(&self) -> String {
+        let setting = self
+            .argument_effort
+            .as_ref()
+            .or(self.selected_profile().effort.as_ref());
+        let label = if self.argument_effort.is_some() {
+            "Use launch arguments"
+        } else {
+            "Use profile setting"
+        };
+        format!(
+            "{label} ({})",
+            setting.map_or("Codex default", |s| s.value.as_str())
+        )
+    }
+
+    /// Set an explicit, validated override, or clear it with `profile`.
+    pub fn set_effort(&mut self, level: &str) -> Result<(), String> {
+        if self.is_done() {
+            return Err(format!("the launcher is already {}", self.status.name()));
+        }
+        let setting = if level == "profile" {
+            None
+        } else {
+            self.discover_effort();
+            if !self.effort_choices().levels.iter().any(|s| s == level) {
+                return Err(format!(
+                    "effort {level:?} is not available; choose profile{}",
+                    self.effort_choices()
+                        .levels
+                        .iter()
+                        .map(|s| format!(", {s}"))
+                        .collect::<String>()
+                ));
+            }
+            Some(Setting {
+                value: level.to_owned(),
+                source: Source::Override,
+            })
+        };
+        self.commands[self.selected] = match &setting {
+            Some(setting) => self.base_commands[self.selected].with_effort(&setting.value),
+            None => self.base_commands[self.selected].clone(),
+        };
+        self.effort_overrides[self.selected] = setting;
+        self.effort_picker = None;
+        self.notice = None;
+        Ok(())
+    }
+
+    pub fn save_effort(&mut self) -> Result<(), String> {
+        if self.is_done() {
+            return Err(format!("the launcher is already {}", self.status.name()));
+        }
+        let effort = self.effort_overrides[self.selected]
+            .as_ref()
+            .ok_or("choose an effort override before saving")?
+            .value
+            .clone();
+        profile::save_effort(self.selected_profile(), &effort)
+            .map_err(|error| format!("{error:#}"))?;
+        let refreshed = profile::load(&self.catalog.codex_home)
+            .map_err(|error| format!("effort saved, but cannot reload profiles: {error:#}"))?;
+        // Keep selections and other profiles' temporary overrides in place.
+        for (index, profile) in self.catalog.profiles.iter_mut().enumerate() {
+            if let Some(updated) = refreshed.find(&profile.name) {
+                if profile.model != updated.model
+                    || profile.provider != updated.provider
+                    || profile.model_catalog != updated.model_catalog
+                {
+                    self.effort_choices[index] =
+                        Choices::load(updated, &self.catalog.codex_home, &self.extra_args);
+                    self.effort_queried[index] = false;
+                }
+                *profile = updated.clone();
+            }
+        }
+        self.catalog.warnings = refreshed.warnings;
+        // Retain the override if launch arguments would otherwise supersede
+        // the value just saved. Clearing it still restores the original args.
+        if self.argument_effort.is_none() {
+            self.set_effort("profile")?;
+        }
+        self.effort_picker = None;
+        self.notice = Some(format!(
+            "Saved effort {effort} to {}",
+            self.selected_profile().path.display()
+        ));
+        Ok(())
+    }
+
+    fn open_effort_picker(&mut self) {
+        self.discover_effort();
+        let selected = self.effort_overrides[self.selected]
+            .as_ref()
+            .and_then(|setting| {
+                self.effort_choices()
+                    .levels
+                    .iter()
+                    .position(|s| s == &setting.value)
+            })
+            .map_or(0, |index| index + 1);
+        self.effort_picker = Some(EffortPicker { selected });
+        self.notice = None;
+    }
+
+    fn press_effort_picker(&mut self, key: Key) {
+        let last = self.effort_choices().levels.len();
+        let picker = self.effort_picker.as_mut().unwrap();
+        match key {
+            Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => picker.selected = (picker.selected + 1).min(last),
+            Key::Home | Key::Char('g') => picker.selected = 0,
+            Key::End | Key::Char('G') => picker.selected = last,
+            Key::Esc | Key::Char('q') => self.effort_picker = None,
+            Key::Ctrl('c') => self.apply(Action::Quit),
+            Key::Enter | Key::Char('s') => {
+                let selected = picker.selected;
+                if key == Key::Char('s') && selected == 0 {
+                    self.notice = Some("Choose an explicit effort level to save.".to_owned());
+                    return;
+                }
+                let level = if selected == 0 {
+                    "profile".to_owned()
+                } else {
+                    self.effort_choices().levels[selected - 1].clone()
+                };
+                let result = self.set_effort(&level).and_then(|()| {
+                    if key == Key::Char('s') {
+                        self.save_effort()
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = result {
+                    self.notice = Some(error);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -251,6 +464,13 @@ impl App {
 
     /// Apply the action that `key` maps to, if any.
     pub fn press(&mut self, key: Key) {
+        if self.is_done() {
+            return;
+        }
+        if self.effort_picker.is_some() {
+            self.press_effort_picker(key);
+            return;
+        }
         if let Some(action) = action_for(key) {
             self.apply(action);
         }
@@ -277,6 +497,12 @@ impl App {
                     .saturating_add(self.page_step())
                     .min(self.view.details_max_scroll);
             }
+            Action::EditEffort => self.open_effort_picker(),
+            Action::SaveEffort => {
+                if let Err(error) = self.save_effort() {
+                    self.notice = Some(error);
+                }
+            }
             Action::Launch => self.status = Status::Launching(self.command().clone()),
             Action::Quit => self.status = Status::Quitting,
         }
@@ -301,6 +527,8 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
+        self.effort_picker = None;
+        self.notice = None;
         if index != self.selected {
             self.selected = index;
             self.view.details_scroll = 0;
@@ -310,6 +538,8 @@ impl App {
     /// The state that `ctl` reports.
     pub fn state<'a>(&'a self, instance: &'a Instance) -> StateView<'a> {
         let command = self.command();
+        let mut profile = ProfileView::new(self.selected_profile(), command, false);
+        profile.effort = self.effective_effort();
         StateView {
             pid: instance.pid,
             mode: instance.mode,
@@ -321,8 +551,24 @@ impl App {
             selected_index: self.selected,
             command: command.argv(),
             command_line: command.display(),
-            menu: self.catalog.profiles.iter().map(MenuEntry::new).collect(),
-            profile: ProfileView::new(self.selected_profile(), command, false),
+            menu: self
+                .catalog
+                .profiles
+                .iter()
+                .enumerate()
+                .map(|(index, profile)| {
+                    let mut entry = MenuEntry::new(profile);
+                    entry.effort = self.effort_at(index).map(|setting| setting.value.as_str());
+                    entry
+                })
+                .collect(),
+            profile,
+            effort_choices: self.effort_choices(),
+            effort_picker: self.effort_picker.as_ref(),
+            effort_override: self.effort_overrides[self.selected]
+                .as_ref()
+                .map(|s| s.value.as_str()),
+            notice: self.notice.as_deref(),
             details: Details {
                 scroll: self.view.details_scroll,
                 max_scroll: self.view.details_max_scroll,
@@ -380,6 +626,10 @@ pub struct StateView<'a> {
     pub command_line: String,
     pub menu: Vec<MenuEntry<'a>>,
     pub profile: ProfileView<'a>,
+    pub effort_choices: &'a Choices,
+    pub effort_picker: Option<&'a EffortPicker>,
+    pub effort_override: Option<&'a str>,
+    pub notice: Option<&'a str>,
     pub details: Details,
     pub warnings: &'a [String],
 }

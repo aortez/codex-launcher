@@ -21,7 +21,7 @@ running menu through `codex-launcher ctl`.
 │            ││# Team gateway with a key from the environment.               │
 │            ││model = "gpt-team"                                            │
 └────────────┘└────────────────────────────────────────────────── 1-13 of 21 ┘
-↑/↓ move · Enter launch · PgUp/PgDn scroll · q quit
+↑/↓ move · e effort · Enter launch · PgUp/PgDn scroll · q quit
 ```
 
 ## Install
@@ -98,6 +98,48 @@ first or last profile, `PgUp`/`PgDn` scroll the details, `Enter` launches, and
 `q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher process with
 Codex, so Codex gets the terminal and nothing is left running.
 
+### Changing effort
+
+Press `e` to open the effort picker for the selected profile. Use `↑`/`↓`
+(or `k`/`j`) to choose a level, then `Enter` to apply it for this launch.
+`Esc` cancels. Applying a choice returns to the menu; press `Enter` again
+to launch. The details pane marks temporary choices `(override)` and shows
+the updated command with `-c 'model_reasoning_effort="high"'`.
+
+Choose **Use profile setting** to clear the temporary override. Each
+profile keeps its own temporary choice while the menu is open; closing
+the launcher discards those choices. If you supplied an effort through
+Codex arguments, the reset choice reads **Use launch arguments** and
+restores that value. A menu override takes precedence over those arguments.
+
+To make a choice permanent, press `s` in the picker, or apply it and press
+`s` in the main menu. This saves only `model_reasoning_effort` to the selected
+`<name>.config.toml`; for `default`, it saves to `config.toml`, affecting
+profiles that inherit their effort. Comments, other settings, credentials,
+and file permissions are preserved. Invalid TOML and symlinked config files
+are not overwritten. Saving clears the temporary override unless it is
+still needed to take precedence over an effort in the launch arguments.
+
+The picker runs `codex debug models` to get the model's supported levels,
+matching its exact name. Discovery runs on the first `e` or `ctl effort`
+interaction for each profile, and results are reused while the menu is open.
+Model flags and `-c` overrides are included in discovery; prompts and runtime
+subcommands are not. The command has a two-second timeout.
+
+Because this diagnostic does not accept `--profile`, named profiles use a
+temporary private config snapshot with the same base/profile table merge.
+This keeps profile credentials out of process arguments. The snapshot is
+removed after the query; the original config files stay in place.
+
+If the command is missing, fails, or has no matching model, the picker falls
+back to `model_catalog_json` (relative to `CODEX_HOME`) or the built-in OpenAI
+provider's `models_cache.json`. Without matching metadata, it offers common
+levels and labels model support as unknown; the provider may reject unsupported
+choices. Additional runtime `--profile`, `--oss`, and `--local-provider`
+arguments use this unverified fallback. Wrappers must forward the generated
+arguments to Codex. The settings pane still shows the base/profile values;
+it does not resolve project or managed configuration layers.
+
 ## Using it from scripts
 
 Each menu listens on a Unix socket at
@@ -111,6 +153,9 @@ codex-launcher ctl state           # The menu, the selection, and the command En
 codex-launcher ctl screen          # The screen as plain text.
 codex-launcher ctl key down down   # Press keys, then print the new state.
 codex-launcher ctl select local    # Move the selection to a profile by name.
+codex-launcher ctl effort high     # Set a temporary effort for the selection.
+codex-launcher ctl effort profile  # Clear the override; restore profile/arguments.
+codex-launcher ctl save-effort     # Save the temporary effort to the selected file.
 codex-launcher ctl launch          # Launch the selection, like pressing Enter.
 codex-launcher ctl quit
 ```
@@ -121,6 +166,14 @@ Keys go through the same keymap as the keyboard. Key names are `up`, `down`,
 request with an unknown key or profile name changes nothing and exits with
 status 1. A reply comes after the menu has applied the request and redrawn, so
 it always matches the screen.
+
+`ctl state` reports the effective effort in `profile.effort` and each menu
+entry. `effort_override` is the selected profile's temporary choice, or null;
+`effort_choices` includes the available levels and their metadata source
+(null when support is unknown). `effort_picker` reports the open picker's
+selected index, where zero means inheritance, or null when closed. `notice`
+contains save feedback or a keyboard-action error, when present. Invalid
+`ctl effort` values fail without changing the current choice.
 
 ```
 $ codex-launcher ctl key down

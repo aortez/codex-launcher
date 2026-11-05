@@ -140,6 +140,8 @@ where
             Err(error) => Some(error),
         },
         Request::Select { profile } => app.select_name(profile).err(),
+        Request::Effort { level } => app.set_effort(level).err(),
+        Request::SaveEffort => app.save_effort().err(),
         Request::Launch => {
             app.apply(Action::Launch);
             None

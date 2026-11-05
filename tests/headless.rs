@@ -13,6 +13,205 @@ fn fixture_home() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-home")
 }
 
+fn writable_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(fixture_home()).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), home.path().join(entry.file_name())).unwrap();
+    }
+    home
+}
+
+#[test]
+fn codex_catalog_takes_precedence_and_is_queried_once_per_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = writable_home();
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\n[ \"$1\" = debug ] && [ \"$2\" = models ] || exit 1\nprintf 'query\\n' >> \"$0.calls\"\nprintf '%s\\n' \"$@\" >> \"$0.args\"\nprintf '%s\\n' \"$CODEX_HOME\" >> \"$0.homes\"\n/bin/cat \"$CODEX_HOME/live-catalog.json\"\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-base","supported_reasoning_levels":[{"effort":"low"}]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(home.path().join("live-catalog.json"), r#"{"models":[{"slug":"gpt-base","supported_reasoning_levels":[{"effort":"high"},{"effort":"ultra"}]},{"slug":"gpt-team","supported_reasoning_levels":[{"effort":"medium"},{"effort":"xhigh"}]}]}"#).unwrap();
+    let launcher = Headless::start_with_path(home.path(), &["--", "resume", "--last"], bin.path());
+    assert!(!bin.path().join("codex.calls").exists());
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "codex debug models"
+    );
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["high", "ultra"])
+    );
+    assert!(!launcher.ctl(&["effort", "low"]).status.success());
+    launcher.ctl_json(&["key", "esc", "e", "esc"]);
+    launcher.ctl_json(&["effort", "ultra"]);
+    launcher.ctl_json(&["save-effort"]);
+    launcher.ctl_json(&["key", "e", "esc"]);
+    assert_eq!(
+        std::fs::read_to_string(bin.path().join("codex.calls")).unwrap(),
+        "query\n"
+    );
+    launcher.ctl_json(&["select", "gateway"]);
+    let state = launcher.ctl_json(&["effort", "xhigh"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "codex debug models"
+    );
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["medium", "xhigh"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(bin.path().join("codex.args")).unwrap(),
+        "debug\nmodels\ndebug\nmodels\n"
+    );
+    let homes = std::fs::read_to_string(bin.path().join("codex.homes")).unwrap();
+    assert_eq!(homes.lines().next().unwrap(), home.path().to_str().unwrap());
+    let snapshot = Path::new(homes.lines().nth(1).unwrap());
+    assert_ne!(snapshot, home.path());
+    assert!(!snapshot.exists(), "temporary config was not cleaned up");
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn effort_picker_applies_cancels_resets_and_launches() {
+    let home = writable_home();
+    let base_path = home.path().join("config.toml");
+    let original = std::fs::read_to_string(&base_path).unwrap();
+    std::fs::write(home.path().join("models_cache.json"), r#"{"models":[{"slug":"gpt-base","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"ultra"}]}]}"#).unwrap();
+    let launcher = Headless::start_in(home.path(), &["--", "resume", "--last"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["low", "high", "ultra"])
+    );
+    let screen = launcher.ctl(&["screen"]);
+    let screen = String::from_utf8(screen.stdout).unwrap();
+    assert!(screen.contains("Use profile setting (high)"), "{screen}");
+    assert!(screen.contains("s: Save to config.toml"), "{screen}");
+    let state = launcher.ctl_json(&["key", "down", "enter"]);
+    assert_eq!(state["status"], "selecting");
+    assert_eq!(state["profile"]["effort"]["source"], "override");
+    assert_eq!(state["menu"][0]["effort"], "low");
+    assert!(state["effort_picker"].is_null());
+    let screen = launcher.ctl(&["screen"]);
+    assert!(
+        String::from_utf8(screen.stdout)
+            .unwrap()
+            .contains("effort    low  (override)")
+    );
+    assert_eq!(
+        launcher.ctl_json(&["key", "e", "end", "esc"])["effort_override"],
+        "low"
+    );
+    assert!(!launcher.ctl(&["effort", "medium"]).status.success());
+    assert_eq!(launcher.ctl_json(&["state"])["effort_override"], "low");
+    launcher.ctl_json(&["select", "gateway"]);
+    let state = launcher.ctl_json(&["effort", "medium"]);
+    assert!(state["effort_choices"]["metadata_source"].is_null());
+    assert_eq!(
+        launcher.ctl_json(&["select", "default"])["effort_override"],
+        "low"
+    );
+    let state = launcher.ctl_json(&["key", "e", "home", "enter"]);
+    assert!(state["effort_override"].is_null());
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "resume", "--last"])
+    );
+    assert_eq!(state["profile"]["effort"]["value"], "high");
+    launcher.ctl_json(&["effort", "ultra"]);
+    launcher.ctl_json(&["launch"]);
+    assert_eq!(
+        launcher.finish(),
+        "codex -c 'model_reasoning_effort=\"ultra\"' resume --last\n"
+    );
+    assert_eq!(std::fs::read_to_string(base_path).unwrap(), original);
+}
+
+#[test]
+fn effort_saves_refresh_inherited_values_and_report_failures() {
+    let home = writable_home();
+    let launcher = Headless::start_in(home.path(), &[]);
+    assert!(!launcher.ctl(&["save-effort"]).status.success());
+    launcher.ctl_json(&["effort", "low"]);
+    let state = launcher.ctl_json(&["save-effort"]);
+    assert!(state["effort_override"].is_null());
+    assert_eq!(state["profile"]["effort"]["source"], "base");
+    assert_eq!(state["menu"][1]["effort"], "low");
+    assert_eq!(state["menu"][2]["effort"], "medium");
+    launcher.ctl_json(&["select", "gateway"]);
+    // Save the highlighted level directly from the picker.
+    let state = launcher.ctl_json(&["key", "e", "home", "down", "s"]);
+    assert_eq!(state["profile"]["effort"]["value"], "none");
+    assert_eq!(state["profile"]["effort"]["source"], "profile");
+    assert!(state["effort_override"].is_null());
+    let path = home.path().join("gateway.config.toml");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("sk-test-secret"));
+    assert!(saved.contains("model_reasoning_effort = \"none\""));
+    let screen = launcher.ctl(&["screen"]);
+    assert!(
+        !String::from_utf8(screen.stdout)
+            .unwrap()
+            .contains("sk-test-secret")
+    );
+    launcher.ctl_json(&["effort", "high"]);
+    std::fs::write(&path, "invalid TOML [").unwrap();
+    let output = launcher.ctl(&["save-effort"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot save invalid TOML"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid TOML [");
+    assert_eq!(launcher.ctl_json(&["state"])["effort_override"], "high");
+    launcher.ctl_json(&["quit"]);
+    assert_eq!(launcher.finish(), "");
+}
+
+#[test]
+fn effort_override_wins_over_arguments_and_reset_restores_them() {
+    let home = writable_home();
+    let launcher = Headless::start_in(
+        home.path(),
+        &["--", "resume", "--last", "-c", "model_reasoning_effort=low"],
+    );
+    assert_eq!(
+        launcher.ctl_json(&["state"])["profile"]["effort"]["source"],
+        "arguments"
+    );
+    let state = launcher.ctl_json(&["effort", "high"]);
+    assert_eq!(
+        state["command"],
+        serde_json::json!([
+            "codex",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "resume",
+            "--last"
+        ])
+    );
+    // Saving must not silently revert this launch to the command-line value.
+    let state = launcher.ctl_json(&["save-effort"]);
+    assert_eq!(state["effort_override"], "high");
+    let state = launcher.ctl_json(&["effort", "profile"]);
+    assert_eq!(state["profile"]["effort"]["value"], "low");
+    assert_eq!(
+        state["command"],
+        serde_json::json!([
+            "codex",
+            "resume",
+            "--last",
+            "-c",
+            "model_reasoning_effort=low"
+        ])
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
 /// A headless launcher with its own socket directory, killed on drop.
 struct Headless {
     child: Child,
@@ -25,12 +224,17 @@ impl Headless {
     }
 
     fn start_in(codex_home: &Path, args: &[&str]) -> Self {
+        Self::start_with_path(codex_home, args, Path::new("/nonexistent"))
+    }
+
+    fn start_with_path(codex_home: &Path, args: &[&str], path: &Path) -> Self {
         let runtime = tempfile::tempdir().unwrap();
         let child = Command::new(BIN)
             .arg("--headless")
             .args(args)
             .env("CODEX_HOME", codex_home)
             .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("PATH", path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

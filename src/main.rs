@@ -2,6 +2,7 @@
 
 mod app;
 mod control;
+mod effort;
 mod launch;
 mod profile;
 mod tui;
@@ -125,6 +126,10 @@ enum CtlCmd {
     },
     /// Move the selection to a profile by name, then print the new state.
     Select { profile: String },
+    /// Set a temporary effort, or use "profile" to clear the override.
+    Effort { level: String },
+    /// Save the selected profile's temporary effort to its config file.
+    SaveEffort,
     /// Launch the selected profile, like pressing Enter.
     Launch,
     /// Close the menu without launching.
@@ -349,6 +354,8 @@ fn ctl(pid: Option<u32>, command: CtlCmd) -> Result<ExitCode> {
         CtlCmd::Screen => Request::Screen,
         CtlCmd::Key { keys } => Request::Key { keys },
         CtlCmd::Select { profile } => Request::Select { profile },
+        CtlCmd::Effort { level } => Request::Effort { level },
+        CtlCmd::SaveEffort => Request::SaveEffort,
         CtlCmd::Launch => Request::Launch,
         CtlCmd::Quit => Request::Quit,
     };

@@ -21,10 +21,8 @@ serde = { version = "=1.0.229", features = ["derive"] }
 # Keep JSON keys in struct order, including through ctl's parse-and-print round trip.
 serde_json = { version = "=1.0.154", features = ["preserve_order"] }
 toml_edit = "=0.25.18"
-unicode-width = "=0.2.2"
-
-[dev-dependencies]
 tempfile = "=3.27.0"
+unicode-width = "=0.2.2"
 
 [lints.rust]
 unsafe_code = "forbid"

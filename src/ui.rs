@@ -7,7 +7,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
@@ -16,7 +16,7 @@ use crate::profile::{Profile, Setting, Source};
 const LABEL_WIDTH: usize = 10;
 const MIN_LIST_WIDTH: u16 = 14;
 const MAX_LIST_WIDTH: u16 = 32;
-const HELP: &str = "↑/↓ move · Enter launch · PgUp/PgDn scroll · q quit";
+const HELP: &str = "↑/↓ move · e effort · Enter launch · PgUp/PgDn scroll · q quit";
 
 /// Draw the menu and record the list and details pane geometry in `app.view`.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -29,6 +29,61 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_list(frame, app, list_area);
     draw_details(frame, app, details_area);
     draw_footer(frame, app, footer);
+    if app.effort_picker.is_some() {
+        draw_effort_picker(frame, app, body);
+    }
+}
+
+fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
+    let picker = app.effort_picker.as_ref().unwrap();
+    let choices = app.effort_choices();
+    let height = u16::try_from(choices.levels.len() + 7)
+        .unwrap_or(u16::MAX)
+        .min(body.height);
+    let width = 66.min(body.width);
+    let area = Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(format!(" Effort · {} ", app.selected_profile().name));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [note, list, save] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    let message = match choices.metadata_source {
+        Some(source) => format!("Levels from {source}."),
+        None => "Model support unknown; these are common levels.".to_owned(),
+    };
+    frame.render_widget(
+        Paragraph::new(message).dim().wrap(Wrap { trim: false }),
+        note,
+    );
+    let items: Vec<ListItem> = std::iter::once(app.inherit_label())
+        .chain(choices.levels.iter().cloned())
+        .map(ListItem::new)
+        .collect();
+    let list_widget = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(list_widget, list, &mut state);
+    let name = app
+        .selected_profile()
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    frame.render_widget(
+        Paragraph::new(format!("Enter: this launch only\ns: Save to {name}")).dim(),
+        save,
+    );
 }
 
 fn list_width(app: &App, total: u16) -> u16 {
@@ -108,6 +163,12 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.notice {
         Some(notice) => Line::from(notice.clone()).fg(Color::Yellow),
+        None if app.effort_picker.is_some() => {
+            Line::from("↑/↓ choose · Enter apply · s save · Esc cancel").dim()
+        }
+        None if app.has_effort_override() => {
+            Line::from("↑/↓ move · e effort · s save effort · Enter launch · q quit").dim()
+        }
         None => Line::from(HELP).dim(),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -133,7 +194,7 @@ pub fn details(app: &App) -> Text<'static> {
     if let Some(url) = &profile.provider.base_url {
         lines.push(row("url", url.clone(), ""));
     }
-    lines.push(setting_line(profile, "effort", profile.effort.as_ref()));
+    lines.push(setting_line(profile, "effort", app.effective_effort()));
     if profile.context_window.is_some() {
         lines.push(setting_line(
             profile,
@@ -174,6 +235,8 @@ fn source_tag(profile: &Profile, source: Source) -> &'static str {
         Source::Base if profile.is_default() => "",
         Source::Base => "(base)",
         Source::Builtin => "(built-in)",
+        Source::Override => "(override)",
+        Source::Arguments => "(arguments)",
     }
 }
 
@@ -319,6 +382,9 @@ mod tests {
         let (_home, mut app) = fixture_app();
         for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0)] {
             let _ = render(&mut app, width, height);
+            app.press(Key::Char('e'));
+            let _ = render(&mut app, width, height);
+            app.press(Key::Esc);
         }
     }
 

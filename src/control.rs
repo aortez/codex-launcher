@@ -33,8 +33,17 @@ const MAX_RESPONSE_BYTES: u64 = 16 << 20;
 pub enum Request {
     State,
     Screen,
-    Key { keys: Vec<String> },
-    Select { profile: String },
+    Key {
+        keys: Vec<String>,
+    },
+    Select {
+        profile: String,
+    },
+    Effort {
+        level: String,
+    },
+    #[serde(rename = "save-effort")]
+    SaveEffort,
     Launch,
     Quit,
 }
