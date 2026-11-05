@@ -7,7 +7,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 /// The menu entry that runs Codex with only the base configuration.
@@ -65,6 +65,10 @@ pub enum Source {
     Base,
     /// Codex's built-in default.
     Builtin,
+    /// A temporary choice in the launcher.
+    Override,
+    /// An explicit Codex command-line setting.
+    Arguments,
 }
 
 /// One effective setting, with the layer that supplied it.
@@ -98,6 +102,7 @@ pub struct Profile {
     pub model: Option<Setting>,
     pub provider: Provider,
     pub effort: Option<Setting>,
+    pub model_catalog: Option<Setting>,
     pub context_window: Option<Setting>,
     pub sandbox: Option<Setting>,
     pub approval: Option<Setting>,
@@ -219,6 +224,68 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
     })
 }
 
+/// Save only the effort key using the original file, never the redacted view.
+/// Re-read before editing to preserve unrelated changes made while the menu was
+/// open. An atomic replacement keeps a failed write from truncating the config.
+pub fn save_effort(profile: &Profile, effort: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = &profile.path;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            bail!(
+                "cannot save effort: {} is not a regular file",
+                path.display()
+            );
+        }
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == ErrorKind::NotFound && profile.is_default() => None,
+        Err(error) => return Err(error).context("cannot inspect profile file"),
+    };
+    let original = if metadata.is_some() {
+        read_limited(path).context("cannot read profile file")?
+    } else {
+        String::new()
+    };
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|error| anyhow::anyhow!("cannot save invalid TOML: {}", error.message()))?;
+    if document
+        .get("model_reasoning_effort")
+        .is_some_and(|item| !item.is_str())
+    {
+        bail!("cannot save: model_reasoning_effort must be a string");
+    }
+    let mut value = Value::from(effort);
+    if let Some(old) = document
+        .get("model_reasoning_effort")
+        .and_then(Item::as_value)
+    {
+        *value.decor_mut() = old.decor().clone();
+    }
+    document["model_reasoning_effort"] = Item::Value(value);
+    let parent = path
+        .parent()
+        .context("profile path has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let permissions = metadata.map_or_else(
+        || fs::Permissions::from_mode(0o600),
+        |meta| meta.permissions(),
+    );
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.write_all(document.to_string().as_bytes())?;
+    temporary.as_file().sync_all()?;
+    // Detect edits during serialization rather than overwriting them.
+    if path.exists() && read_limited(path)? != original {
+        bail!("profile changed while saving; try again");
+    }
+    temporary
+        .persist(path)
+        .context("cannot replace profile file")?;
+    Ok(())
+}
+
 struct ConfigFile {
     text: Option<String>,
     document: Option<DocumentMut>,
@@ -268,6 +335,37 @@ fn read_limited(path: &Path) -> std::io::Result<String> {
     fs::read_to_string(path)
 }
 
+/// The same base/profile table merge Codex performs for runtime commands.
+/// Used for a private config snapshot when a diagnostic lacks --profile.
+pub fn merged_config(codex_home: &Path, profile: &Profile) -> Result<DocumentMut> {
+    fn merge(base: &mut dyn TableLike, layer: &dyn TableLike) {
+        for (key, value) in layer.iter() {
+            if let Some(target) = base.get_mut(key).and_then(Item::as_table_like_mut)
+                && let Some(source) = value.as_table_like()
+            {
+                merge(target, source);
+            } else {
+                base.insert(key, value.clone());
+            }
+        }
+    }
+
+    let base = read_config(&codex_home.join(BASE_CONFIG));
+    if let Some(error) = base.error {
+        bail!("{error}");
+    }
+    let mut document = base.document.unwrap_or_default();
+    if !profile.is_default() {
+        let layer = read_config(&profile.path);
+        if let Some(error) = layer.error {
+            bail!("{error}");
+        }
+        let layer = layer.document.context("profile file no longer exists")?;
+        merge(document.as_table_mut(), layer.as_table());
+    }
+    Ok(document)
+}
+
 /// Build one entry. `layer` is the profile table, or `None` for the default entry.
 fn build_profile(
     name: String,
@@ -292,6 +390,7 @@ fn build_profile(
         model: setting(layer, base, "model"),
         provider: resolve_provider(layer, base),
         effort: setting(layer, base, "model_reasoning_effort"),
+        model_catalog: setting(layer, base, "model_catalog_json"),
         context_window: setting(layer, base, "model_context_window"),
         sandbox: setting(layer, base, "sandbox_mode"),
         approval: setting(layer, base, "approval_policy"),
@@ -550,6 +649,67 @@ pub fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_preserves_comments_credentials_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("work.config.toml");
+        fs::write(&path, "# Profile description\nmodel_reasoning_effort = 'low' # Keep this\napi_key = 'secret-value'\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let catalog = load(home.path()).unwrap();
+        // An unrelated edit after the menu loaded must survive the save.
+        let original = fs::read_to_string(&path).unwrap() + "model = 'new-model'\n";
+        fs::write(&path, &original).unwrap();
+        save_effort(catalog.find("work").unwrap(), "high").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replace("'low'", "\"high\"")
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let updated = load(home.path()).unwrap();
+        let profile = updated.find("work").unwrap();
+        assert_eq!(profile.effort.as_ref().unwrap().value, "high");
+        assert!(!profile.raw.as_ref().unwrap().contains("secret-value"));
+    }
+
+    #[test]
+    fn save_refuses_invalid_toml_and_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("work.config.toml");
+        fs::write(&path, "model = 'test'\n").unwrap();
+        let catalog = load(home.path()).unwrap();
+        let profile = catalog.find("work").unwrap();
+        fs::write(&path, "not valid [").unwrap();
+        assert!(save_effort(profile, "high").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not valid [");
+        fs::remove_file(&path).unwrap();
+        let target = home.path().join("target.toml");
+        fs::write(&target, "model = 'test'\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(save_effort(profile, "high").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "model = 'test'\n");
+    }
+
+    #[test]
+    fn saving_default_creates_private_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let catalog = load(home.path()).unwrap();
+        save_effort(catalog.find("default").unwrap(), "high").unwrap();
+        let path = home.path().join("config.toml");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "model_reasoning_effort = \"high\"\n"
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     fn home_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

@@ -24,6 +24,32 @@ pub struct Command {
 }
 
 impl Command {
+    /// Override effort before subcommands/prompts, removing competing config
+    /// flags while leaving literal arguments after `--` alone.
+    pub fn with_effort(&self, effort: &str) -> Self {
+        let mut command = self.clone();
+        command.args = vec![
+            "-c".to_owned(),
+            format!("model_reasoning_effort={}", toml_edit::Value::from(effort)),
+        ];
+        let mut index = 0;
+        while index < self.args.len() {
+            if self.args[index] == "--" {
+                command.args.extend_from_slice(&self.args[index..]);
+                break;
+            }
+            if let Some((count, assignment)) = crate::effort::config_argument(&self.args, index)
+                && crate::effort::is_effort_assignment(assignment)
+            {
+                index += count;
+                continue;
+            }
+            command.args.push(self.args[index].clone());
+            index += 1;
+        }
+        command
+    }
+
     /// Build the command for `profile`, with `extra` arguments passed through.
     ///
     /// A profile named `NAME` runs `codex-NAME` instead of `codex --profile NAME`
@@ -104,9 +130,13 @@ fn find_wrapper(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
         return None;
     }
     let name = wrapper_name(profile);
+    find_executable(&name, path)
+}
+
+pub fn find_executable(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path?)
         .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(&name))
+        .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
 
@@ -200,5 +230,71 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote("a b"), "'a b'");
+    }
+
+    #[test]
+    fn effort_overrides_config_flags_but_preserves_literal_arguments() {
+        let (_home, catalog) = catalog(&["work"]);
+        let extra = [
+            "--config",
+            "model_reasoning_effort='low'",
+            "resume",
+            "--last",
+            "--config=model_reasoning_effort=medium",
+            "-cmodel_reasoning_effort=high",
+            "-c",
+            "other=true",
+            "--",
+            "-c",
+            "model_reasoning_effort=none",
+        ]
+        .map(str::to_owned);
+        let command = Command::for_profile(catalog.find("work").unwrap(), &extra, None);
+        assert_eq!(
+            crate::effort::argument_effort(&command.args).as_deref(),
+            Some("high")
+        );
+        let updated = command.with_effort("xhigh");
+        assert_eq!(
+            updated.argv(),
+            [
+                "codex",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+                "--profile",
+                "work",
+                "resume",
+                "--last",
+                "-c",
+                "other=true",
+                "--",
+                "-c",
+                "model_reasoning_effort=none"
+            ]
+        );
+        assert_eq!(
+            crate::effort::argument_effort(&updated.args).as_deref(),
+            Some("xhigh")
+        );
+
+        let bin = tempfile::tempdir().unwrap();
+        executable(bin.path(), "codex-work");
+        let command = Command::for_profile(
+            catalog.find("work").unwrap(),
+            &["exec".into(), "fix tests".into()],
+            Some(bin.path().as_os_str()),
+        );
+        let updated = command.with_effort("high");
+        assert_eq!(
+            updated.argv(),
+            [
+                "codex-work",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "exec",
+                "fix tests"
+            ]
+        );
+        assert_eq!(updated.wrapper, command.wrapper);
     }
 }
