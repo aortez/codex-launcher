@@ -257,9 +257,15 @@ codex-launcher ctl launch       # The headless menu prints: codex --profile loca
 
 ## Development
 
+CI runs on pull requests and pushes to `main`, using Rust 1.94.1 on Linux.
+It checks formatting, runs the tests, and treats Clippy warnings as errors.
+The checks use fixtures and loopback servers; no model servers or credentials
+are required. Run the same checks locally with:
+
 ```sh
-cargo test
-cargo clippy --all-targets
+cargo fmt --all --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 `tests/fixtures/codex-home` is a made-up Codex home used by the tests and the
