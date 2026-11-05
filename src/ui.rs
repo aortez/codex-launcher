@@ -57,16 +57,24 @@ fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
         Constraint::Length(2),
     ])
     .areas(inner);
-    let message = match choices.metadata_source {
-        Some(source) => format!("Levels from {source}."),
-        None => "Model support unknown; these are common levels.".to_owned(),
+    let message = match choices.control {
+        crate::effort::Control::Unsupported => {
+            "No effort controls available for this model.".to_owned()
+        }
+        crate::effort::Control::Toggle => {
+            "Thinking on/off from Ollama; no graded effort levels.".to_owned()
+        }
+        _ => match choices.metadata_source {
+            Some(source) => format!("Levels from {source}."),
+            None => "Model support unknown; these are common levels.".to_owned(),
+        },
     };
     frame.render_widget(
         Paragraph::new(message).dim().wrap(Wrap { trim: false }),
         note,
     );
     let items: Vec<ListItem> = std::iter::once(app.inherit_label())
-        .chain(choices.levels.iter().cloned())
+        .chain(choices.levels.iter().map(|level| choices.label(level)))
         .map(ListItem::new)
         .collect();
     let list_widget = List::new(items)
@@ -80,10 +88,12 @@ fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    frame.render_widget(
-        Paragraph::new(format!("Enter: this launch only\ns: Save to {name}")).dim(),
-        save,
-    );
+    let actions = if choices.levels.is_empty() {
+        "Enter: use inherited setting\nEsc: close".to_owned()
+    } else {
+        format!("Enter: this launch only\ns: Save to {name}")
+    };
+    frame.render_widget(Paragraph::new(actions).dim(), save);
 }
 
 fn list_width(app: &App, total: u16) -> u16 {
@@ -163,6 +173,9 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.notice {
         Some(notice) => Line::from(notice.clone()).fg(Color::Yellow),
+        None if app.effort_picker.is_some() && app.effort_choices().levels.is_empty() => {
+            Line::from("Enter use inherited setting · Esc cancel").dim()
+        }
         None if app.effort_picker.is_some() => {
             Line::from("↑/↓ choose · Enter apply · s save · Esc cancel").dim()
         }

@@ -4,6 +4,7 @@ mod app;
 mod control;
 mod effort;
 mod launch;
+mod ollama;
 mod profile;
 mod tui;
 mod ui;

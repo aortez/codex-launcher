@@ -492,3 +492,267 @@ fn direct_launch_dry_run_and_listing() {
     let output = run(&["nope"]);
     assert!(!output.status.success());
 }
+
+/// A local HTTP fixture, with bounded waits and cleanup even on failed assertions.
+struct OllamaServer {
+    base_url: String,
+    requests: std::sync::mpsc::Receiver<(String, Value)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OllamaServer {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/proxy/v1", listener.local_addr().unwrap());
+        let (tx, requests) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut slow_seen = false;
+            while !stopping.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let model = request["model"].as_str().unwrap().to_owned();
+                tx.send((headers, request)).unwrap();
+                if model == "redirect" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                if model == "oversized" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                if model == "slow" && !slow_seen {
+                    slow_seen = true;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\n").unwrap();
+                    while !stopping.load(Ordering::Relaxed) {
+                        if stream.write_all(b" ").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    continue;
+                }
+                let response = match model.as_str() {
+                    "toggle" => serde_json::json!({"thinking":{"values":[false,true]}}),
+                    "coder" => serde_json::json!({"capabilities":["completion","tools"],"details":{"family":"qwen3next"}}),
+                    "unknown" => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"unverified"}}),
+                    _ => serde_json::json!({"capabilities":["completion","thinking"],"details":{"family":"gpt-oss"}}),
+                }.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+            }
+        });
+        Self {
+            base_url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn home(&self, model: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), format!("model={model:?}\nmodel_provider='lab'\nmodel_reasoning_effort='high'\n[model_providers.lab]\nname='Local server'\nbase_url={:?}\nhttp_headers={{ X-Test='header-secret' }}\n", self.base_url)).unwrap();
+        home
+    }
+}
+
+impl Drop for OllamaServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn ollama_controls_drive_the_picker_commands_and_profile_saves() {
+    let server = OllamaServer::start();
+    let home = server.home("custom-oss-alias");
+    for (name, model) in [("toggle", "toggle"), ("coder", "coder")] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            format!("model={model:?}\n"),
+        )
+        .unwrap();
+    }
+    // No Codex executable: server metadata still works.
+    let launcher = Headless::start_in(home.path(), &[]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["levels"],
+        serde_json::json!(["low", "medium", "high"])
+    );
+    assert_eq!(state["effort_choices"]["control"], "levels");
+    assert!(!launcher.ctl(&["effort", "ultra"]).status.success());
+    launcher.ctl_json(&["key", "esc", "e", "esc"]);
+    assert_eq!(
+        server.requests.try_iter().count(),
+        1,
+        "discovery should be cached"
+    );
+    launcher.ctl_json(&["select", "toggle"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(
+        screen.contains("Thinking off (none)") && screen.contains("Thinking on (medium)"),
+        "{screen}"
+    );
+    let state = launcher.ctl_json(&["effort", "none"]);
+    assert!(
+        state["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "model_reasoning_effort=\"none\"")
+    );
+    launcher.ctl_json(&["save-effort"]);
+    assert!(
+        std::fs::read_to_string(home.path().join("toggle.config.toml"))
+            .unwrap()
+            .contains("model_reasoning_effort = \"none\"")
+    );
+    launcher.ctl_json(&["select", "coder"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "unsupported");
+    assert_eq!(state["effort_choices"]["levels"], serde_json::json!([]));
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(screen.contains("No effort controls available"), "{screen}");
+    assert!(!screen.contains("s: Save to"), "{screen}");
+    assert!(!launcher.ctl(&["effort", "high"]).status.success());
+    launcher.ctl_json(&["effort", "profile"]);
+    for (headers, _) in server.requests.try_iter() {
+        assert!(
+            headers.starts_with("POST /proxy/api/show HTTP/1.1"),
+            "{headers}"
+        );
+        assert!(headers.contains("x-test: header-secret"), "{headers}");
+    }
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn ollama_slow_body_shares_batch_deadline_and_can_retry() {
+    let server = OllamaServer::start();
+    let home = server.home("slow");
+    for name in ["a", "b"] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            "model='toggle'\n",
+        )
+        .unwrap();
+    }
+    let launcher = Headless::start_in(home.path(), &[]);
+    let started = Instant::now();
+    let state = launcher.ctl_json(&["key", "e", "esc", "down", "e", "esc", "down", "e", "esc"]);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(state["selected"], "b");
+    launcher.ctl_json(&["select", "default"]);
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(
+        state["effort_choices"]["metadata_source"],
+        "Ollama model family"
+    );
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn ollama_unverified_redirected_and_oversized_responses_remain_unknown() {
+    let server = OllamaServer::start();
+    for model in ["unknown", "redirect", "oversized"] {
+        let home = server.home(model);
+        let launcher = Headless::start_in(home.path(), &[]);
+        let state = launcher.ctl_json(&["key", "e"]);
+        assert!(state["effort_choices"]["metadata_source"].is_null());
+        assert_eq!(state["effort_choices"]["control"], "unknown");
+        launcher.ctl_json(&["quit"]);
+        assert_eq!(server.requests.try_iter().count(), 1);
+    }
+}
+
+#[test]
+fn ollama_fallback_uses_runtime_target_after_codex_has_no_matching_model() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = OllamaServer::start();
+    let home = server.home("wrong-model");
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\nprintf '{\"models\":[]}'\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        "model_providers.runtime={{name='Runtime',base_url={:?}}}",
+        server.base_url
+    );
+    let launcher = Headless::start_with_path(
+        home.path(),
+        &[
+            "--",
+            "-m=toggle",
+            "-c",
+            "model_provider='runtime'",
+            "-c",
+            &config,
+        ],
+        bin.path(),
+    );
+    let state = launcher.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["control"], "toggle");
+    let (headers, body) = server
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(body["model"], "toggle");
+    assert!(
+        !headers.contains("header-secret"),
+        "headers belong to the overridden provider"
+    );
+    launcher.ctl_json(&["quit"]);
+}
