@@ -1,6 +1,7 @@
 //! codex-launcher: pick a Codex CLI profile, then launch Codex with it.
 
 mod app;
+mod check;
 mod control;
 mod effort;
 mod launch;
@@ -21,6 +22,7 @@ use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, MenuEntry, ProfileView, unknown_profile};
+use crate::check::Checks;
 use crate::control::Request;
 use crate::launch::Command;
 use crate::profile::Catalog;
@@ -83,6 +85,10 @@ struct Cli {
     /// Print the Codex command instead of running it.
     #[arg(long, requires = "profile")]
     dry_run: bool,
+
+    /// Open the menu without checking model servers; press r to check them.
+    #[arg(long)]
+    no_check: bool,
 }
 
 #[derive(Subcommand)]
@@ -92,6 +98,9 @@ enum Cmd {
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Check whether each profile's model server lists its model.
+        #[arg(long)]
+        check: bool,
     },
     /// Show one profile's effective settings and its file, with secrets hidden.
     Show {
@@ -214,7 +223,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Some(Cmd::List { json }) => list(&load()?, json),
+        Some(Cmd::List { json, check }) => list(&load()?, json, check),
         Some(Cmd::Show { profile, json }) => show(&load()?, &profile, json),
         Some(Cmd::Ctl { pid, command }) => ctl(pid, command),
         None => menu_or_launch(cli),
@@ -259,8 +268,11 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
         return Err(command.exec());
     }
 
-    let app = App::new(catalog, &cli.codex_args, path.as_deref(), home_dir());
+    let mut app = App::new(catalog, &cli.codex_args, path.as_deref(), home_dir());
     print_warnings(app.catalog());
+    if !cli.no_check {
+        app.check_servers();
+    }
     if cli.headless {
         let (columns, rows) = cli.size;
         return tui::run_headless(app, columns, rows);
@@ -268,42 +280,66 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
     tui::run_terminal(app)
 }
 
-fn list(catalog: &Catalog, json: bool) -> Result<ExitCode> {
+fn list(catalog: &Catalog, json: bool, check: bool) -> Result<ExitCode> {
     print_warnings(catalog);
     let path = path_var();
+    let commands: Vec<_> = catalog
+        .profiles
+        .iter()
+        .map(|profile| Command::for_profile(profile, &[], path.as_deref()))
+        .collect();
+    let mut checks = Checks::new(catalog.profiles.len());
+    if check {
+        checks.start(catalog, &commands, &[]);
+        checks.wait();
+    }
     if json {
         let views = catalog
             .profiles
             .iter()
-            .map(|profile| {
-                let command = Command::for_profile(profile, &[], path.as_deref());
-                serde_json::to_value(ProfileView::new(profile, &command, false))
+            .zip(&commands)
+            .enumerate()
+            .map(|(index, (profile, command))| {
+                let mut view = ProfileView::new(profile, command, false);
+                view.server = checks.status(index);
+                serde_json::to_value(view)
             })
             .collect::<Result<Vec<_>, _>>()?;
         print_json(&Value::Array(views))?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let header = ["PROFILE", "MODEL", "PROVIDER", "EFFORT", "DESCRIPTION"].map(String::from);
-    let rows: Vec<[String; 5]> = catalog
+    let mut header = vec!["PROFILE", "MODEL", "PROVIDER", "EFFORT"];
+    if check {
+        header.push("SERVER");
+    }
+    header.push("DESCRIPTION");
+    let header: Vec<String> = header.into_iter().map(String::from).collect();
+    let rows: Vec<Vec<String>> = catalog
         .profiles
         .iter()
-        .map(|profile| {
+        .enumerate()
+        .map(|(index, profile)| {
             let entry = MenuEntry::new(profile);
             let mut provider = entry.provider.to_owned();
             if profile.provider.missing {
                 provider.push_str(" (not defined)");
             }
-            [
+            let mut row = vec![
                 entry.name.to_owned(),
                 entry.model.unwrap_or("-").to_owned(),
                 provider,
                 entry.effort.unwrap_or("-").to_owned(),
-                profile.description.clone().unwrap_or_default(),
-            ]
+            ];
+            if let Some(status) = checks.status(index) {
+                row.push(status.state.label().to_owned());
+            }
+            row.push(profile.description.clone().unwrap_or_default());
+            row
         })
         .collect();
-    let mut widths = [0usize; 4];
+    // Every column but the last, unpadded description is aligned.
+    let mut widths = vec![0usize; header.len() - 1];
     for row in std::iter::once(&header).chain(&rows) {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.width());
@@ -312,11 +348,11 @@ fn list(catalog: &Catalog, json: bool) -> Result<ExitCode> {
     let mut out = io::stdout().lock();
     for row in std::iter::once(&header).chain(&rows) {
         let mut line = String::new();
-        for (cell, width) in row.iter().zip(widths) {
+        for (cell, width) in row.iter().zip(&widths) {
             line.push_str(cell);
             line.push_str(&" ".repeat(width - cell.width() + 2));
         }
-        line.push_str(&row[4]);
+        line.push_str(&row[widths.len()]);
         writeln!(out, "{}", line.trim_end())?;
     }
     Ok(ExitCode::SUCCESS)
@@ -481,8 +517,27 @@ mod tests {
         assert!(!cli.headless);
         assert_eq!(cli.codex_args, ["--headless"]);
 
+        let cli = parse(&["--no-check", "--", "resume"]).unwrap();
+        assert!(cli.no_check);
+        assert_eq!(cli.profile, None);
+        assert_eq!(cli.codex_args, ["resume"]);
+
         let cli = parse(&["list"]).unwrap();
-        assert!(matches!(cli.command, Some(Cmd::List { json: false })));
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::List {
+                json: false,
+                check: false
+            })
+        ));
+        let cli = parse(&["list", "--check", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::List {
+                json: true,
+                check: true
+            })
+        ));
 
         let cli = parse(&["ctl", "key", "down", "enter"]).unwrap();
         assert!(matches!(cli.command, Some(Cmd::Ctl { .. })));

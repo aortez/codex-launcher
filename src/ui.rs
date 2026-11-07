@@ -11,12 +11,15 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
+use crate::check::{State, Status};
 use crate::profile::{Profile, Setting, Source};
 
 const LABEL_WIDTH: usize = 10;
 const MIN_LIST_WIDTH: u16 = 14;
 const MAX_LIST_WIDTH: u16 = 32;
-const HELP: &str = "↑/↓ move · e effort · Enter launch · PgUp/PgDn scroll · q quit";
+/// A server mark and the space after it, shown once checks start.
+const MARK_WIDTH: u16 = 2;
+const HELP: &str = "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · q quit";
 
 /// Draw the menu and record the list and details pane geometry in `app.view`.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -107,25 +110,35 @@ fn list_width(app: &App, total: u16) -> u16 {
         .map(|profile| profile.name.width())
         .max()
         .unwrap_or(0);
+    let marks = if app.checks_started() { MARK_WIDTH } else { 0 };
     // Two border columns and the two-column highlight symbol.
-    let wanted = u16::try_from(longest + 4).unwrap_or(u16::MAX);
+    let wanted = u16::try_from(longest + 4)
+        .unwrap_or(u16::MAX)
+        .saturating_add(marks);
     wanted
-        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
+        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH + marks)
         .min(total.saturating_sub(10).max(MIN_LIST_WIDTH.min(total)))
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let marks = app.checks_started();
     let items: Vec<ListItem> = app
         .catalog()
         .profiles
         .iter()
-        .map(|profile| {
+        .enumerate()
+        .map(|(index, profile)| {
             let style = if profile.error.is_some() || profile.provider.missing {
                 Style::new().fg(Color::Yellow)
             } else {
                 Style::new()
             };
-            ListItem::new(Line::styled(profile.name.clone(), style))
+            let mut spans = Vec::new();
+            if marks {
+                spans.push(mark(app.server_status_at(index)));
+            }
+            spans.push(Span::styled(profile.name.clone(), style));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
@@ -210,6 +223,9 @@ pub fn details(app: &App) -> Text<'static> {
     if let Some(url) = &profile.provider.base_url {
         lines.push(row("url", url.clone(), ""));
     }
+    if let Some(status) = app.server_status() {
+        lines.push(server_line(status));
+    }
     lines.push(setting_line(profile, "effort", app.effective_effort()));
     if profile.context_window.is_some() {
         lines.push(setting_line(
@@ -280,6 +296,46 @@ fn provider_line(profile: &Profile) -> Line<'static> {
         line.push_span(Span::raw("  defined in base").dim());
     }
     line
+}
+
+/// A distinct symbol for each state, so the list reads without color.
+fn mark(status: Option<&Status>) -> Span<'static> {
+    let Some(status) = status else {
+        return Span::raw("  ");
+    };
+    let symbol = match status.state {
+        State::Ready => "✓ ",
+        State::Reachable => "? ",
+        State::ModelMissing => "! ",
+        State::Down => "✗ ",
+        State::Checking => "… ",
+        State::Skipped => "  ",
+    };
+    Span::styled(symbol, state_style(status.state))
+}
+
+fn server_line(status: &Status) -> Line<'static> {
+    let mut text = status.state.label().to_owned();
+    if status.state == State::Checking {
+        text.push('…');
+    }
+    if let Some(message) = &status.message {
+        text.push_str(": ");
+        text.push_str(message);
+    }
+    Line::from(vec![
+        Span::raw(format!("{:<LABEL_WIDTH$}", "server")).bold(),
+        Span::styled(text, state_style(status.state)),
+    ])
+}
+
+fn state_style(state: State) -> Style {
+    match state {
+        State::Ready => Style::new().fg(Color::Green),
+        State::Reachable | State::ModelMissing => Style::new().fg(Color::Yellow),
+        State::Down => Style::new().fg(Color::Red),
+        State::Checking | State::Skipped => Style::new().add_modifier(Modifier::DIM),
+    }
 }
 
 fn row(label: &str, value: String, tag: &str) -> Line<'static> {
