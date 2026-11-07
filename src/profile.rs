@@ -20,7 +20,7 @@ const MAX_CONFIG_BYTES: u64 = 1 << 20;
 pub const REDACTED: &str = "<redacted>";
 
 /// Providers that Codex knows without a `[model_providers.<id>]` table.
-const BUILTIN_PROVIDERS: &[&str] = &[
+pub const BUILTIN_PROVIDERS: &[&str] = &[
     "amazon-bedrock",
     "amazon-bedrock-runtime",
     "gcp",

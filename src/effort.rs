@@ -206,6 +206,7 @@ fn query_catalog(
     let deadline = Instant::now() + timeout;
     let config = profile::merged_config(codex_home, profile)?;
     let (config_args, model) = query_arguments(args, config.get("model").and_then(|m| m.as_str()))?;
+    let model = model.context("no configured model to match")?;
     // The debug command does not accept --profile. Give it the merged config
     // through a private snapshot, so credentials never become process arguments.
     let snapshot = if profile.is_default() {
@@ -296,7 +297,7 @@ fn profile_snapshot(codex_home: &Path, config: &str) -> Result<tempfile::TempDir
 pub(crate) fn query_arguments(
     args: &[String],
     initial_model: Option<&str>,
-) -> Result<(Vec<String>, String)> {
+) -> Result<(Vec<String>, Option<String>)> {
     let mut model = initial_model.map(str::to_owned);
     let mut model_flag_value = None;
     let mut forwarded = Vec::new();
@@ -330,7 +331,7 @@ pub(crate) fn query_arguments(
             || arg == "--oss"
             || arg.starts_with("--local-provider")
         {
-            bail!("runtime provider/profile selection cannot be queried");
+            bail!("launch arguments select the profile or provider");
         }
         index += 1;
     }
@@ -342,7 +343,7 @@ pub(crate) fn query_arguments(
         ]);
         model = Some(value);
     }
-    Ok((forwarded, model.context("no configured model to match")?))
+    Ok((forwarded, model))
 }
 
 fn config_string(value: &str) -> String {
@@ -423,7 +424,7 @@ mod tests {
         ]
         .map(str::to_owned);
         let (forwarded, model) = query_arguments(&args, Some("base")).unwrap();
-        assert_eq!(model, "explicit");
+        assert_eq!(model.as_deref(), Some("explicit"));
         assert_eq!(
             forwarded,
             [

@@ -58,6 +58,9 @@ fn terminal_loop(
 ) -> Result<()> {
     let mut dirty = true;
     while !app.is_done() {
+        if app.poll_checks() {
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| ui::draw(frame, app))?;
             dirty = false;
@@ -125,6 +128,8 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Server checks finish in the background; report what has arrived.
+    app.poll_checks();
     // Leave room within the client's five-second timeout for redrawing and
     // replying. A batch shares this budget rather than resetting it per key.
     app.set_discovery_deadline(Some(pending.received_at + effort::QUERY_TIMEOUT));

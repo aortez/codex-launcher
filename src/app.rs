@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use serde::Serialize;
 
+use crate::check::{self, Checks, State};
 use crate::effort::{self, Choices};
 use crate::launch::Command;
 use crate::profile::{self, Catalog, Profile, Provider, Setting, Source};
@@ -136,6 +137,7 @@ pub enum Action {
     ScrollDown,
     EditEffort,
     SaveEffort,
+    Recheck,
     Launch,
     Quit,
 }
@@ -151,6 +153,7 @@ pub fn action_for(key: Key) -> Option<Action> {
         Key::PageDown => Action::ScrollDown,
         Key::Char('e') => Action::EditEffort,
         Key::Char('s') => Action::SaveEffort,
+        Key::Char('r') => Action::Recheck,
         Key::Enter => Action::Launch,
         Key::Esc | Key::Char('q') | Key::Ctrl('c') => Action::Quit,
         _ => return None,
@@ -196,6 +199,7 @@ pub struct App {
     effort_choices: Vec<Choices>,
     effort_queried: Vec<bool>,
     discovery_deadline: Option<Instant>,
+    checks: Checks,
     codex_path: Option<PathBuf>,
     extra_args: Vec<String>,
     pub effort_picker: Option<EffortPicker>,
@@ -236,6 +240,7 @@ impl App {
             .collect();
         let effort_overrides = vec![None; catalog.profiles.len()];
         let effort_queried = vec![false; catalog.profiles.len()];
+        let checks = Checks::new(catalog.profiles.len());
         Self {
             catalog,
             base_commands: commands.clone(),
@@ -248,6 +253,7 @@ impl App {
             effort_choices,
             effort_queried,
             discovery_deadline: None,
+            checks,
             codex_path: crate::launch::find_executable(crate::launch::CODEX, path),
             extra_args: extra_args.to_vec(),
             effort_picker: None,
@@ -342,6 +348,32 @@ impl App {
     /// Bound all discovery work in one control request, including batched keys.
     pub fn set_discovery_deadline(&mut self, deadline: Option<Instant>) {
         self.discovery_deadline = deadline;
+    }
+
+    /// Check every profile's model server, unless a check is still running.
+    pub fn check_servers(&mut self) {
+        if !self.checks.is_running() {
+            self.checks
+                .start(&self.catalog, &self.base_commands, &self.extra_args);
+        }
+    }
+
+    /// Apply finished server checks. Returns whether the screen changed.
+    pub fn poll_checks(&mut self) -> bool {
+        self.checks.poll()
+    }
+
+    /// Whether server checks have started, so the menu shows their marks.
+    pub fn checks_started(&self) -> bool {
+        self.checks.started()
+    }
+
+    pub fn server_status(&self) -> Option<&check::Status> {
+        self.server_status_at(self.selected)
+    }
+
+    pub fn server_status_at(&self, index: usize) -> Option<&check::Status> {
+        self.checks.status(index)
     }
 
     pub fn inherit_label(&self) -> String {
@@ -540,6 +572,7 @@ impl App {
                     self.notice = Some(error);
                 }
             }
+            Action::Recheck => self.check_servers(),
             Action::Launch => self.status = Status::Launching(self.command().clone()),
             Action::Quit => self.status = Status::Quitting,
         }
@@ -577,6 +610,7 @@ impl App {
         let command = self.command();
         let mut profile = ProfileView::new(self.selected_profile(), command, false);
         profile.effort = self.effective_effort();
+        profile.server = self.server_status();
         StateView {
             pid: instance.pid,
             mode: instance.mode,
@@ -596,6 +630,7 @@ impl App {
                 .map(|(index, profile)| {
                     let mut entry = MenuEntry::new(profile);
                     entry.effort = self.effort_at(index).map(|setting| setting.value.as_str());
+                    entry.server = self.server_status_at(index).map(|status| status.state);
                     entry
                 })
                 .collect(),
@@ -684,6 +719,9 @@ pub struct MenuEntry<'a> {
     pub model: Option<&'a str>,
     pub provider: &'a str,
     pub effort: Option<&'a str>,
+    /// The server check's state, once checks run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<State>,
 }
 
 impl<'a> MenuEntry<'a> {
@@ -696,6 +734,7 @@ impl<'a> MenuEntry<'a> {
                 .effort
                 .as_ref()
                 .map(|setting| setting.value.as_str()),
+            server: None,
         }
     }
 }
@@ -708,6 +747,9 @@ pub struct ProfileView<'a> {
     pub description: Option<&'a str>,
     pub model: Option<&'a Setting>,
     pub provider: &'a Provider,
+    /// The server check, once checks run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<&'a check::Status>,
     pub effort: Option<&'a Setting>,
     pub context_window: Option<&'a Setting>,
     pub sandbox: Option<&'a Setting>,
@@ -729,6 +771,7 @@ impl<'a> ProfileView<'a> {
             description: profile.description.as_deref(),
             model: profile.model.as_ref(),
             provider: &profile.provider,
+            server: None,
             effort: profile.effort.as_ref(),
             context_window: profile.context_window.as_ref(),
             sandbox: profile.sandbox.as_ref(),
