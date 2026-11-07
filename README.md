@@ -5,7 +5,7 @@ profile and launching Codex with it. You can also list, inspect, and launch
 profiles from the command line, and another program can read and drive a
 running menu through `codex-launcher ctl`.
 
-![codex-launcher showing sample profiles, inherited effort, and redacted configuration](docs/images/launcher.png)
+![codex-launcher showing sample profiles with server checks, inherited effort, and redacted configuration](docs/images/launcher.png)
 
 *The menu running with the repository’s sample profiles.*
 
