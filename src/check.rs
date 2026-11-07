@@ -276,6 +276,11 @@ fn describe(error: &reqwest::Error) -> String {
     let mut innermost = None;
     let mut cause = std::error::Error::source(error);
     while let Some(error) = cause {
+        // hyper-util's label for any failed name lookup. The system's own
+        // reason is long enough to wrap the details pane and varies by platform.
+        if error.to_string() == "dns error" {
+            return "could not resolve the host".to_owned();
+        }
         innermost = Some(error);
         cause = error.source();
     }
@@ -449,5 +454,15 @@ mod tests {
             panic!("a closed port must be down");
         };
         assert_eq!(reason, "connection refused");
+    }
+
+    #[test]
+    fn unresolvable_hosts_are_reported_briefly() {
+        // RFC 6761 reserves .invalid, so this name never resolves.
+        let url = Url::parse("http://launcher-check.invalid/v1/models").unwrap();
+        let Reply::Down(reason) = fetch(provider::client().unwrap(), url, HeaderMap::new()) else {
+            panic!("an unresolvable host must be down");
+        };
+        assert_eq!(reason, "could not resolve the host");
     }
 }
