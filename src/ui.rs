@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::App;
+use crate::app::{App, Scroll};
 use crate::check::{State, Status};
 use crate::profile::{Profile, Setting, Source};
 
@@ -150,40 +150,40 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
-    let profile = app.selected_profile();
-    let title = format!(" {} ", profile.name);
+    let block = Block::bordered().title(format!(" {} ", app.selected_profile().name));
     let text = details(app);
-    let block = Block::bordered().title(title);
+    draw_scrolled(frame, area, block, text, &mut app.view.details);
+}
+
+/// Draw `text` wrapped in `block` at the offset in `scroll`.
+///
+/// Records the page height and scroll limit in `scroll`, and shows which lines
+/// are visible in the bottom border when the text does not fit.
+fn draw_scrolled<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block<'a>,
+    text: Text<'a>,
+    scroll: &mut Scroll,
+) {
     let inner = block.inner(area);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
 
     // line_count wraps exactly as rendering does, so the scroll limit matches the screen.
     let total = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
-    app.view.details_page = inner.height;
-    app.view.details_max_scroll = total.saturating_sub(inner.height);
-    app.view.details_scroll = app.view.details_scroll.min(app.view.details_max_scroll);
+    scroll.page = inner.height;
+    scroll.max_scroll = total.saturating_sub(inner.height);
+    scroll.scroll = scroll.scroll.min(scroll.max_scroll);
 
     let mut block = block;
-    if app.view.details_max_scroll > 0 {
-        let shown_to = app
-            .view
-            .details_scroll
-            .saturating_add(inner.height)
-            .min(total);
+    if scroll.max_scroll > 0 {
+        let shown_to = scroll.scroll.saturating_add(inner.height).min(total);
         block = block.title_bottom(
-            Line::from(format!(
-                " {}-{} of {} ",
-                app.view.details_scroll + 1,
-                shown_to,
-                total
-            ))
-            .right_aligned(),
+            Line::from(format!(" {}-{} of {} ", scroll.scroll + 1, shown_to, total))
+                .right_aligned(),
         );
     }
-    frame.render_widget(
-        paragraph.block(block).scroll((app.view.details_scroll, 0)),
-        area,
-    );
+    frame.render_widget(paragraph.block(block).scroll((scroll.scroll, 0)), area);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -436,13 +436,13 @@ mod tests {
         app.press(Key::Down);
         let screen = render(&mut app, 80, 12);
         assert!(screen.contains(" of "), "{screen}");
-        let max = app.view.details_max_scroll;
+        let max = app.view.details.max_scroll;
         assert!(max > 0);
         for _ in 0..20 {
             app.press(Key::PageDown);
         }
         let screen = render(&mut app, 80, 12);
-        assert_eq!(app.view.details_scroll, max);
+        assert_eq!(app.view.details.scroll, max);
         assert!(
             screen.contains("GATEWAY_API_KEY") || screen.contains("http_headers"),
             "{screen}"

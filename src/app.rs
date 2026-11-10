@@ -182,11 +182,34 @@ impl Status {
 #[derive(Debug, Default)]
 pub struct View {
     pub list: ListState,
-    /// The details pane scroll offset, in wrapped lines.
-    pub details_scroll: u16,
-    pub details_max_scroll: u16,
-    /// The number of visible lines in the details pane.
-    pub details_page: u16,
+    pub details: Scroll,
+}
+
+/// A scrolling pane's position. Each draw records the page height and the
+/// scroll limit, and clamps the offset to them.
+#[derive(Debug, Default, Serialize)]
+pub struct Scroll {
+    /// The offset, in wrapped lines.
+    pub scroll: u16,
+    pub max_scroll: u16,
+    /// The number of visible lines.
+    #[serde(skip)]
+    pub page: u16,
+}
+
+impl Scroll {
+    fn up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    fn down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines).min(self.max_scroll);
+    }
+
+    /// One page of scrolling, keeping one line of context.
+    fn page_step(&self) -> u16 {
+        self.page.saturating_sub(1).max(1)
+    }
 }
 
 /// The launcher menu state.
@@ -555,17 +578,8 @@ impl App {
             Action::Next => self.select((self.selected + 1).min(last)),
             Action::First => self.select(0),
             Action::Last => self.select(last),
-            Action::ScrollUp => {
-                self.view.details_scroll =
-                    self.view.details_scroll.saturating_sub(self.page_step());
-            }
-            Action::ScrollDown => {
-                self.view.details_scroll = self
-                    .view
-                    .details_scroll
-                    .saturating_add(self.page_step())
-                    .min(self.view.details_max_scroll);
-            }
+            Action::ScrollUp => self.view.details.up(self.view.details.page_step()),
+            Action::ScrollDown => self.view.details.down(self.view.details.page_step()),
             Action::EditEffort => self.open_effort_picker(),
             Action::SaveEffort => {
                 if let Err(error) = self.save_effort() {
@@ -591,17 +605,12 @@ impl App {
         Ok(())
     }
 
-    /// One page of details scrolling, keeping one line of context.
-    fn page_step(&self) -> u16 {
-        self.view.details_page.saturating_sub(1).max(1)
-    }
-
     fn select(&mut self, index: usize) {
         self.effort_picker = None;
         self.notice = None;
         if index != self.selected {
             self.selected = index;
-            self.view.details_scroll = 0;
+            self.view.details.scroll = 0;
         }
     }
 
@@ -641,10 +650,7 @@ impl App {
                 .as_ref()
                 .map(|s| s.value.as_str()),
             notice: self.notice.as_deref(),
-            details: Details {
-                scroll: self.view.details_scroll,
-                max_scroll: self.view.details_max_scroll,
-            },
+            details: &self.view.details,
             warnings: &self.catalog.warnings,
         }
     }
@@ -702,14 +708,8 @@ pub struct StateView<'a> {
     pub effort_picker: Option<&'a EffortPicker>,
     pub effort_override: Option<&'a str>,
     pub notice: Option<&'a str>,
-    pub details: Details,
+    pub details: &'a Scroll,
     pub warnings: &'a [String],
-}
-
-#[derive(Serialize)]
-pub struct Details {
-    pub scroll: u16,
-    pub max_scroll: u16,
 }
 
 /// One menu row.
@@ -883,18 +883,18 @@ mod tests {
     #[test]
     fn selecting_resets_details_scroll() {
         let (_home, mut app) = fixture_app();
-        app.view.details_max_scroll = 10;
-        app.view.details_page = 4;
+        app.view.details.max_scroll = 10;
+        app.view.details.page = 4;
         app.press(Key::PageDown);
-        assert_eq!(app.view.details_scroll, 3);
+        assert_eq!(app.view.details.scroll, 3);
         app.press(Key::PageDown);
         app.press(Key::PageDown);
         app.press(Key::PageDown);
-        assert_eq!(app.view.details_scroll, 10);
+        assert_eq!(app.view.details.scroll, 10);
         app.press(Key::PageUp);
-        assert_eq!(app.view.details_scroll, 7);
+        assert_eq!(app.view.details.scroll, 7);
         app.press(Key::Down);
-        assert_eq!(app.view.details_scroll, 0);
+        assert_eq!(app.view.details.scroll, 0);
     }
 
     #[test]
