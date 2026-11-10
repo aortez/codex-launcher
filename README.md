@@ -99,7 +99,9 @@ and marks the profile:
 | `✗` | down | No answer, an HTTP 5xx error, or refused credentials. |
 | `…` | checking | The server has not answered yet. |
 
-Press `?` in the menu to see these marks explained beside the list.
+Press `?` in the menu to see these marks explained beside the list:
+
+![The help screen beside the profile list, explaining the server marks and the keys](docs/images/help.png)
 
 The `server` line in the details pane gives the reason, such as
 `down: connection refused` or `model missing: the server has qwen3-coder:30b`.
