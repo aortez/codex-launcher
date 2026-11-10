@@ -19,11 +19,12 @@ const MIN_LIST_WIDTH: u16 = 14;
 const MAX_LIST_WIDTH: u16 = 32;
 /// A server mark and the space after it, shown once checks start.
 const MARK_WIDTH: u16 = 2;
-const HINTS: &str =
-    "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit";
-/// The hints for a footer too narrow for `HINTS`, as in an 80-column
-/// terminal. They leave out scrolling, which the help lists.
-const SHORT_HINTS: &str = "↑/↓ move · e effort · r recheck · Enter launch · ? help · q quit";
+/// The main menu's key hints, after "↑/↓ move".
+const HINTS: &str = "e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit";
+/// The key hints while an effort override is unsaved, after "↑/↓ move".
+const OVERRIDE_HINTS: &str = "e effort · s save effort · Enter launch · ? help · q quit";
+/// The narrowest help meaning column worth keeping beside its name.
+const MIN_MEANING_WIDTH: usize = 20;
 
 /// What each server mark means, in the order the help lists them.
 const MARKS: [(State, &str); 6] = [
@@ -57,7 +58,7 @@ const KEYS: [(&str, &str); 9] = [
     ("q, Esc, or Ctrl-C", "Quit."),
 ];
 
-/// Draw the menu and record the list and details pane geometry in `app.view`.
+/// Draw the menu, fitting `app.view` and the open help to the screen.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
@@ -81,11 +82,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_help(frame: &mut Frame, help: &mut Scroll, area: Rect) {
     frame.render_widget(Clear, area);
     let block = Block::bordered().title(" Help ");
-    draw_scrolled(frame, area, block, help_text(), help);
+    let text = help_text(block.inner(area).width);
+    draw_scrolled(frame, area, block, text, help);
 }
 
-/// The help screen: what the list's marks and colors mean, and the keys.
-fn help_text() -> Text<'static> {
+/// The help screen for a pane `width` columns wide: what the list's marks and
+/// colors mean, and the menu's keys.
+fn help_text(width: u16) -> Text<'static> {
+    let width = usize::from(width);
     let label_width = 2 + MARKS
         .iter()
         .map(|(state, _)| state.label().width())
@@ -94,30 +98,62 @@ fn help_text() -> Text<'static> {
     let keys_width = 2 + KEYS.iter().map(|(keys, _)| keys.width()).max().unwrap_or(0);
 
     let mut lines = vec![Line::from("Server marks").bold()];
-    lines.extend(MARKS.iter().map(|&(state, meaning)| {
-        Line::from(vec![
+    for &(state, meaning) in &MARKS {
+        let name = vec![
             mark(Some(state)),
             Span::styled(
                 format!("{:<label_width$}", state.label()),
                 state_style(state),
             ),
-            Span::raw(meaning),
-        ])
-    }));
+        ];
+        lines.extend(help_row(name, meaning, width));
+    }
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::raw("Yellow").fg(Color::Yellow),
         Span::raw(" profile names mark a file error or an undefined provider."),
     ]));
     lines.push(Line::default());
-    lines.push(Line::from("Keys").bold());
-    lines.extend(KEYS.iter().map(|&(keys, action)| {
-        Line::from(vec![
-            Span::raw(format!("{keys:<keys_width$}")).bold(),
-            Span::raw(action),
-        ])
-    }));
+    lines.push(Line::from("Menu keys").bold());
+    for &(keys, action) in &KEYS {
+        let name = vec![Span::raw(format!("{keys:<keys_width$}")).bold()];
+        lines.extend(help_row(name, action, width));
+    }
     Text::from(lines)
+}
+
+/// A help row: `name`, then `meaning` wrapped within `width` so that it stays
+/// in its own column. A column too narrow to read is left to the paragraph.
+fn help_row(name: Vec<Span<'static>>, meaning: &str, width: usize) -> Vec<Line<'static>> {
+    let indent: usize = name.iter().map(Span::width).sum();
+    let column = width.saturating_sub(indent);
+    let mut parts = if column < MIN_MEANING_WIDTH {
+        vec![meaning.to_owned()]
+    } else {
+        wrap(meaning, column)
+    }
+    .into_iter();
+    let mut first = name;
+    first.extend(parts.next().map(Span::raw));
+    std::iter::once(Line::from(first))
+        .chain(parts.map(|part| Line::from(format!("{}{part}", " ".repeat(indent)))))
+        .collect()
+}
+
+/// Break `text` at spaces into lines at most `width` columns wide. A longer
+/// word gets a line of its own.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split(' ') {
+        match lines.last_mut() {
+            Some(line) if line.width() + 1 + word.width() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines
 }
 
 fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
@@ -253,20 +289,18 @@ fn draw_scrolled<'a>(
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
 
     // line_count wraps exactly as rendering does, so the scroll limit matches the screen.
-    let total = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
-    scroll.page = inner.height;
-    scroll.max_scroll = total.saturating_sub(inner.height);
-    scroll.scroll = scroll.scroll.min(scroll.max_scroll);
+    let lines = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
+    scroll.fit(inner.height, lines);
 
     let mut block = block;
-    if scroll.max_scroll > 0 {
-        let shown_to = scroll.scroll.saturating_add(inner.height).min(total);
+    if scroll.max_offset > 0 {
+        let shown_to = scroll.offset.saturating_add(inner.height).min(lines);
         block = block.title_bottom(
-            Line::from(format!(" {}-{} of {} ", scroll.scroll + 1, shown_to, total))
+            Line::from(format!(" {}-{} of {} ", scroll.offset + 1, shown_to, lines))
                 .right_aligned(),
         );
     }
-    frame.render_widget(paragraph.block(block).scroll((scroll.scroll, 0)), area);
+    frame.render_widget(paragraph.block(block).scroll((scroll.offset, 0)), area);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -278,17 +312,25 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         None if app.effort_picker.is_some() => {
             Line::from("↑/↓ choose · Enter apply · s save · Esc cancel").dim()
         }
-        None if app.help.as_ref().is_some_and(|help| help.max_scroll > 0) => {
+        None if app.help.as_ref().is_some_and(|help| help.max_offset > 0) => {
             Line::from("↑/↓ scroll · Esc close").dim()
         }
         None if app.help.is_some() => Line::from("Esc close").dim(),
-        None if app.has_effort_override() => {
-            Line::from("↑/↓ move · e effort · s save effort · Enter launch · ? help · q quit").dim()
-        }
-        None if HINTS.width() <= usize::from(area.width) => Line::from(HINTS).dim(),
-        None => Line::from(SHORT_HINTS).dim(),
+        None if app.has_effort_override() => hints(OVERRIDE_HINTS, area.width),
+        None => hints(HINTS, area.width),
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// `rest` after "↑/↓ move", or alone when both do not fit in `width`. The
+/// arrows are the first hint to go, as the keys least in need of one.
+fn hints(rest: &'static str, width: u16) -> Line<'static> {
+    let full = format!("↑/↓ move · {rest}");
+    if full.width() <= usize::from(width) {
+        Line::from(full).dim()
+    } else {
+        Line::from(rest).dim()
+    }
 }
 
 /// The details pane text for the selected profile.
@@ -471,7 +513,7 @@ pub fn buffer_text(buffer: &Buffer) -> String {
 mod tests {
     use super::*;
     use crate::app::Key;
-    use crate::test_support::fixture_app;
+    use crate::test_support::{fixture_app, fixture_home};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -524,13 +566,13 @@ mod tests {
         app.press(Key::Down);
         let screen = render(&mut app, 80, 12);
         assert!(screen.contains(" of "), "{screen}");
-        let max = app.view.details.max_scroll;
+        let max = app.view.details.max_offset;
         assert!(max > 0);
         for _ in 0..20 {
             app.press(Key::PageDown);
         }
         let screen = render(&mut app, 80, 12);
-        assert_eq!(app.view.details.scroll, max);
+        assert_eq!(app.view.details.offset, max);
         assert!(
             screen.contains("GATEWAY_API_KEY") || screen.contains("http_headers"),
             "{screen}"
@@ -538,12 +580,28 @@ mod tests {
     }
 
     #[test]
-    fn narrow_footer_leaves_out_scrolling_to_keep_help_and_quit() {
+    fn narrow_footers_leave_out_the_arrows_first() {
+        let footer = |app: &mut App, width: u16| -> String {
+            render(app, width, 24).lines().last().unwrap().to_owned()
+        };
         let (_home, mut app) = fixture_app();
-        let wide = render(&mut app, 100, 30);
-        assert!(wide.ends_with(&format!("\n{HINTS}\n")), "{wide}");
-        let narrow = render(&mut app, 80, 24);
-        assert!(narrow.ends_with(&format!("\n{SHORT_HINTS}\n")), "{narrow}");
+        assert_eq!(
+            footer(&mut app, 83),
+            "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit"
+        );
+        assert_eq!(
+            footer(&mut app, 82),
+            "e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit"
+        );
+        app.set_effort("low").unwrap();
+        assert_eq!(
+            footer(&mut app, 68),
+            "↑/↓ move · e effort · s save effort · Enter launch · ? help · q quit"
+        );
+        assert_eq!(
+            footer(&mut app, 67),
+            "e effort · s save effort · Enter launch · ? help · q quit"
+        );
     }
 
     #[test]
@@ -572,8 +630,8 @@ mod tests {
         app.press(Key::Char('?'));
         let screen = render(&mut app, 80, 12);
         let help = app.help.as_ref().unwrap();
-        assert!(help.max_scroll > 0);
-        let position = format!(" 1-{} of {} ", help.page, help.page + help.max_scroll);
+        assert!(help.max_offset > 0);
+        let position = format!(" 1-{} of {} ", help.page, help.page + help.max_offset);
         assert!(
             screen.contains(&position),
             "{position:?} missing:\n{screen}"
@@ -583,6 +641,26 @@ mod tests {
         app.press(Key::End);
         let screen = render(&mut app, 80, 12);
         assert!(screen.contains("Quit."), "{screen}");
+    }
+
+    #[test]
+    fn help_keeps_its_columns_beside_a_wide_list() {
+        let home = fixture_home();
+        let name = "a-long-profile-name-for-tests";
+        std::fs::write(home.path().join(format!("{name}.config.toml")), "").unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        app.press(Key::Char('?'));
+        let screen = render(&mut app, 80, 40);
+        // The widest list leaves the help 46 columns, so meanings wrap within
+        // their column instead of back to the border.
+        for expected in [
+            "│? reachable      The server answered, but not ",
+            "│                 with a model list. ",
+            "│s                  Save the chosen effort to ",
+            "│                   the profile's file. ",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
     }
 
     #[test]

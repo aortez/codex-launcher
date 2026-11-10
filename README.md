@@ -251,10 +251,12 @@ contains save feedback or a keyboard-action error, when present. Invalid
 `--no-check`, these fields are absent until the first check.
 `list --check --json` adds the same `server` object to each profile.
 
-`help` is null until `ctl key '?'` opens the help screen; quote the `?` so the
-shell does not expand it. While the help is open, `help` reports its `scroll`
-and `max_scroll`, and keys scroll it until `?`, `Esc`, `q`, or `Enter` closes
-it.
+`help` is null unless the help screen is open, from the keyboard or from
+`ctl key '?'` (quote the `?` so the shell does not expand it); then it reports
+the help's `scroll` and `max_scroll`. While the help or the effort picker is
+open, keys go to it instead of the menu: `r` does not check the servers, and
+`Esc` or `q` closes it rather than quitting. Read `help` and `effort_picker`
+before sending menu keys.
 
 ```
 $ codex-launcher ctl key down

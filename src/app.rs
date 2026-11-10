@@ -187,25 +187,35 @@ pub struct View {
     pub details: Scroll,
 }
 
-/// A scrolling pane's position. Each draw records the page height and the
-/// scroll limit, and clamps the offset to them.
+/// A scrolling pane's position, which each draw fits to the pane.
 #[derive(Debug, Default, Serialize)]
 pub struct Scroll {
-    /// The offset, in wrapped lines.
-    pub scroll: u16,
-    pub max_scroll: u16,
+    /// The first visible line, counting wrapped lines.
+    #[serde(rename = "scroll")]
+    pub offset: u16,
+    /// The offset that shows the last line at the bottom.
+    #[serde(rename = "max_scroll")]
+    pub max_offset: u16,
     /// The number of visible lines.
     #[serde(skip)]
     pub page: u16,
 }
 
 impl Scroll {
+    /// Record that the pane shows `page` of the text's `lines`, and keep the
+    /// offset within them.
+    pub fn fit(&mut self, page: u16, lines: u16) {
+        self.page = page;
+        self.max_offset = lines.saturating_sub(page);
+        self.offset = self.offset.min(self.max_offset);
+    }
+
     fn up(&mut self, lines: u16) {
-        self.scroll = self.scroll.saturating_sub(lines);
+        self.offset = self.offset.saturating_sub(lines);
     }
 
     fn down(&mut self, lines: u16) {
-        self.scroll = self.scroll.saturating_add(lines).min(self.max_scroll);
+        self.offset = self.offset.saturating_add(lines).min(self.max_offset);
     }
 
     /// One page of scrolling, keeping one line of context.
@@ -228,7 +238,8 @@ pub struct App {
     codex_path: Option<PathBuf>,
     extra_args: Vec<String>,
     pub effort_picker: Option<EffortPicker>,
-    /// The help screen's position, while it is open.
+    /// The help screen's position while it is open. The renderer fits it to
+    /// the screen, as it does `view`.
     pub help: Option<Scroll>,
     selected: usize,
     status: Status,
@@ -585,8 +596,8 @@ impl App {
             Key::Down | Key::Char('j') => help.down(1),
             Key::PageUp => help.up(help.page_step()),
             Key::PageDown => help.down(help.page_step()),
-            Key::Home | Key::Char('g') => help.scroll = 0,
-            Key::End | Key::Char('G') => help.scroll = help.max_scroll,
+            Key::Home | Key::Char('g') => help.offset = 0,
+            Key::End | Key::Char('G') => help.offset = help.max_offset,
             Key::Char('?') | Key::Enter | Key::Esc | Key::Char('q') => self.help = None,
             Key::Ctrl('c') => self.apply(Action::Quit),
             _ => {}
@@ -639,7 +650,7 @@ impl App {
         self.notice = None;
         if index != self.selected {
             self.selected = index;
-            self.view.details.scroll = 0;
+            self.view.details.offset = 0;
         }
     }
 
@@ -914,18 +925,17 @@ mod tests {
     #[test]
     fn selecting_resets_details_scroll() {
         let (_home, mut app) = fixture_app();
-        app.view.details.max_scroll = 10;
-        app.view.details.page = 4;
+        app.view.details.fit(4, 14);
         app.press(Key::PageDown);
-        assert_eq!(app.view.details.scroll, 3);
-        app.press(Key::PageDown);
+        assert_eq!(app.view.details.offset, 3);
         app.press(Key::PageDown);
         app.press(Key::PageDown);
-        assert_eq!(app.view.details.scroll, 10);
+        app.press(Key::PageDown);
+        assert_eq!(app.view.details.offset, 10);
         app.press(Key::PageUp);
-        assert_eq!(app.view.details.scroll, 7);
+        assert_eq!(app.view.details.offset, 7);
         app.press(Key::Down);
-        assert_eq!(app.view.details.scroll, 0);
+        assert_eq!(app.view.details.offset, 0);
     }
 
     #[test]
@@ -955,10 +965,9 @@ mod tests {
     fn help_takes_keys_until_it_closes() {
         let (_home, mut app) = fixture_app();
         app.press(Key::Char('?'));
-        let help = app.help.as_mut().unwrap();
-        help.max_scroll = 5;
-        help.page = 3;
-        for (key, scroll) in [
+        // Three visible lines of eight.
+        app.help.as_mut().unwrap().fit(3, 8);
+        for (key, offset) in [
             (Key::Down, 1),
             (Key::PageDown, 3),
             (Key::End, 5),
@@ -967,10 +976,13 @@ mod tests {
             (Key::Home, 0),
         ] {
             app.press(key);
-            assert_eq!(app.help.as_ref().unwrap().scroll, scroll, "{key:?}");
+            assert_eq!(app.help.as_ref().unwrap().offset, offset, "{key:?}");
         }
+        // Menu keys do nothing while the help is open.
         app.press(Key::Char('e'));
+        app.press(Key::Char('s'));
         assert!(app.effort_picker.is_none());
+        assert!(app.notice.is_none());
         let instance = Instance {
             pid: 42,
             mode: "headless",
@@ -983,6 +995,9 @@ mod tests {
             serde_json::json!({"scroll": 0, "max_scroll": 5})
         );
         assert_eq!(state["selected"], "default");
+        assert!(app.help.is_some());
+        app.press(Key::Ctrl('c'));
+        assert_eq!(app.status(), &Status::Quitting);
 
         for key in [Key::Char('?'), Key::Enter, Key::Esc, Key::Char('q')] {
             let (_home, mut app) = fixture_app();
@@ -993,8 +1008,13 @@ mod tests {
             let state = serde_json::to_value(app.state(&instance)).unwrap();
             assert!(state["help"].is_null(), "{key:?}");
         }
-        app.press(Key::Ctrl('c'));
-        assert_eq!(app.status(), &Status::Quitting);
+
+        // The effort picker does not hand ? to the menu.
+        let (_home, mut app) = fixture_app();
+        app.press(Key::Char('e'));
+        app.press(Key::Char('?'));
+        assert!(app.help.is_none());
+        assert!(app.effort_picker.is_some());
     }
 
     #[test]
