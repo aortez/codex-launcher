@@ -35,6 +35,8 @@ Profiles are $CODEX_HOME/<name>.config.toml files (CODEX_HOME defaults to
 named codex-<name> is on PATH, launching <name> runs it instead of
 `codex --profile <name>`; the wrapper must select the profile itself.
 
+In the menu, press ? to see what the keys and the server marks mean.
+
 Examples:
   codex-launcher                      Open the menu.
   codex-launcher -- resume --last     Open the menu; pass the args to Codex.

@@ -81,9 +81,9 @@ can only be launched from the menu.
 
 In the menu, `↑`/`↓` (or `k`/`j`) move, `Home`/`End` (or `g`/`G`) jump to the
 first or last profile, `PgUp`/`PgDn` scroll the details, `r` checks the model
-servers again, `Enter` launches, and `q`, `Esc`, or `Ctrl-C` quits. Launching
-replaces the launcher process with Codex, so Codex gets the terminal and
-nothing is left running.
+servers again, `?` shows what the keys and the server marks mean, `Enter`
+launches, and `q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher
+process with Codex, so Codex gets the terminal and nothing is left running.
 
 ### Server checks
 
@@ -98,6 +98,10 @@ and marks the profile:
 | `?` | reachable | The server answered, but not with a model list. |
 | `✗` | down | No answer, an HTTP 5xx error, or refused credentials. |
 | `…` | checking | The server has not answered yet. |
+
+Press `?` in the menu to see these marks explained beside the list:
+
+![The help screen beside the profile list, explaining the server marks and the keys](docs/images/help.png)
 
 The `server` line in the details pane gives the reason, such as
 `down: connection refused` or `model missing: the server has qwen3-coder:30b`.
@@ -246,6 +250,13 @@ contains save feedback or a keyboard-action error, when present. Invalid
 `ctl key r` checks again; read `ctl state` until no entry is `checking`. With
 `--no-check`, these fields are absent until the first check.
 `list --check --json` adds the same `server` object to each profile.
+
+`help` is null unless the help screen is open, from the keyboard or from
+`ctl key '?'` (quote the `?` so the shell does not expand it); then it reports
+the help's `scroll` and `max_scroll`. While the help or the effort picker is
+open, keys go to it instead of the menu: `r` does not check the servers, and
+`Esc` or `q` closes it rather than quitting. Read `help` and `effort_picker`
+before sending menu keys.
 
 ```
 $ codex-launcher ctl key down

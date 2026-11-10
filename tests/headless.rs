@@ -466,6 +466,24 @@ fn bad_requests_change_nothing() {
 }
 
 #[test]
+fn help_takes_ctl_keys_until_it_closes() {
+    let launcher = Headless::start(&["--size", "80x12"]);
+    assert!(launcher.ctl_json(&["state"])["help"].is_null());
+    let state = launcher.ctl_json(&["key", "?", "end"]);
+    let max = state["help"]["max_scroll"].as_u64().unwrap();
+    assert!(max > 0, "{state}");
+    assert_eq!(state["help"]["scroll"], max);
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(screen.contains("Quit."), "{screen}");
+
+    // While the help is open, q closes it instead of quitting.
+    let state = launcher.ctl_json(&["key", "q"]);
+    assert!(state["help"].is_null(), "{state}");
+    assert_eq!(state["status"], "selecting");
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
 fn batched_keys_scroll_like_separate_keys() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("a.config.toml"), "model = \"short\"\n").unwrap();
