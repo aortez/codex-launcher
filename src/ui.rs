@@ -19,7 +19,43 @@ const MIN_LIST_WIDTH: u16 = 14;
 const MAX_LIST_WIDTH: u16 = 32;
 /// A server mark and the space after it, shown once checks start.
 const MARK_WIDTH: u16 = 2;
-const HELP: &str = "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · q quit";
+const HINTS: &str =
+    "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit";
+/// The hints for a footer too narrow for `HINTS`, as in an 80-column
+/// terminal. They leave out scrolling, which the help lists.
+const SHORT_HINTS: &str = "↑/↓ move · e effort · r recheck · Enter launch · ? help · q quit";
+
+/// What each server mark means, in the order the help lists them.
+const MARKS: [(State, &str); 6] = [
+    (State::Ready, "The server lists the profile's model."),
+    (
+        State::ModelMissing,
+        "The server answered without the model.",
+    ),
+    (
+        State::Reachable,
+        "The server answered, but not with a model list.",
+    ),
+    (
+        State::Down,
+        "No answer, a 5xx error, or refused credentials.",
+    ),
+    (State::Checking, "The server has not answered yet."),
+    (State::Skipped, "The details pane's server line says why."),
+];
+
+/// The menu's keys, as the help lists them.
+const KEYS: [(&str, &str); 9] = [
+    ("↑/↓ or k/j", "Move the selection."),
+    ("Home/End or g/G", "Select the first or last profile."),
+    ("PgUp/PgDn", "Scroll the details."),
+    ("e", "Choose the reasoning effort."),
+    ("s", "Save the chosen effort to the profile's file."),
+    ("r", "Check the servers again."),
+    ("Enter", "Launch the selected profile."),
+    ("?", "Show or hide this help."),
+    ("q, Esc, or Ctrl-C", "Quit."),
+];
 
 /// Draw the menu and record the list and details pane geometry in `app.view`.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -31,10 +67,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_list(frame, app, list_area);
     draw_details(frame, app, details_area);
+    if let Some(help) = &mut app.help {
+        draw_help(frame, help, details_area);
+    }
+    // The footer reads the help's scroll limit, so it comes after the help.
     draw_footer(frame, app, footer);
     if app.effort_picker.is_some() {
         draw_effort_picker(frame, app, body);
     }
+}
+
+/// Draw the help over the details pane, beside the list whose marks it explains.
+fn draw_help(frame: &mut Frame, help: &mut Scroll, area: Rect) {
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(" Help ");
+    draw_scrolled(frame, area, block, help_text(), help);
+}
+
+/// The help screen: what the list's marks and colors mean, and the keys.
+fn help_text() -> Text<'static> {
+    let label_width = 2 + MARKS
+        .iter()
+        .map(|(state, _)| state.label().width())
+        .max()
+        .unwrap_or(0);
+    let keys_width = 2 + KEYS.iter().map(|(keys, _)| keys.width()).max().unwrap_or(0);
+
+    let mut lines = vec![Line::from("Server marks").bold()];
+    lines.extend(MARKS.iter().map(|&(state, meaning)| {
+        Line::from(vec![
+            mark(Some(state)),
+            Span::styled(
+                format!("{:<label_width$}", state.label()),
+                state_style(state),
+            ),
+            Span::raw(meaning),
+        ])
+    }));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::raw("Yellow").fg(Color::Yellow),
+        Span::raw(" profile names mark a file error or an undefined provider."),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from("Keys").bold());
+    lines.extend(KEYS.iter().map(|&(keys, action)| {
+        Line::from(vec![
+            Span::raw(format!("{keys:<keys_width$}")).bold(),
+            Span::raw(action),
+        ])
+    }));
+    Text::from(lines)
 }
 
 fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
@@ -135,7 +218,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let mut spans = Vec::new();
             if marks {
-                spans.push(mark(app.server_status_at(index)));
+                spans.push(mark(app.server_status_at(index).map(|status| status.state)));
             }
             spans.push(Span::styled(profile.name.clone(), style));
             ListItem::new(Line::from(spans))
@@ -195,10 +278,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         None if app.effort_picker.is_some() => {
             Line::from("↑/↓ choose · Enter apply · s save · Esc cancel").dim()
         }
-        None if app.has_effort_override() => {
-            Line::from("↑/↓ move · e effort · s save effort · Enter launch · q quit").dim()
+        None if app.help.as_ref().is_some_and(|help| help.max_scroll > 0) => {
+            Line::from("↑/↓ scroll · Esc close").dim()
         }
-        None => Line::from(HELP).dim(),
+        None if app.help.is_some() => Line::from("Esc close").dim(),
+        None if app.has_effort_override() => {
+            Line::from("↑/↓ move · e effort · s save effort · Enter launch · ? help · q quit").dim()
+        }
+        None if HINTS.width() <= usize::from(area.width) => Line::from(HINTS).dim(),
+        None => Line::from(SHORT_HINTS).dim(),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -299,11 +387,11 @@ fn provider_line(profile: &Profile) -> Line<'static> {
 }
 
 /// A distinct symbol for each state, so the list reads without color.
-fn mark(status: Option<&Status>) -> Span<'static> {
-    let Some(status) = status else {
+fn mark(state: Option<State>) -> Span<'static> {
+    let Some(state) = state else {
         return Span::raw("  ");
     };
-    let symbol = match status.state {
+    let symbol = match state {
         State::Ready => "✓ ",
         State::Reachable => "? ",
         State::ModelMissing => "! ",
@@ -311,7 +399,7 @@ fn mark(status: Option<&Status>) -> Span<'static> {
         State::Checking => "… ",
         State::Skipped => "  ",
     };
-    Span::styled(symbol, state_style(status.state))
+    Span::styled(symbol, state_style(state))
 }
 
 fn server_line(status: &Status) -> Line<'static> {
@@ -450,11 +538,62 @@ mod tests {
     }
 
     #[test]
+    fn narrow_footer_leaves_out_scrolling_to_keep_help_and_quit() {
+        let (_home, mut app) = fixture_app();
+        let wide = render(&mut app, 100, 30);
+        assert!(wide.ends_with(&format!("\n{HINTS}\n")), "{wide}");
+        let narrow = render(&mut app, 80, 24);
+        assert!(narrow.ends_with(&format!("\n{SHORT_HINTS}\n")), "{narrow}");
+    }
+
+    #[test]
+    fn help_explains_the_marks_beside_the_list() {
+        let (_home, mut app) = fixture_app();
+        app.press(Key::Char('?'));
+        let screen = render(&mut app, 100, 30);
+        for expected in [
+            "│> default",
+            "┌ Help ",
+            "✓ ready          The server lists the profile's model.",
+            "✗ down           No answer,",
+            "  not checked    The details pane's server line says why.",
+            "Yellow profile names",
+            "q, Esc, or Ctrl-C  Quit.",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        assert!(screen.ends_with("\nEsc close\n"), "{screen}");
+        assert!(!screen.contains("launch    codex"), "{screen}");
+    }
+
+    #[test]
+    fn help_scrolls_when_it_does_not_fit() {
+        let (_home, mut app) = fixture_app();
+        app.press(Key::Char('?'));
+        let screen = render(&mut app, 80, 12);
+        let help = app.help.as_ref().unwrap();
+        assert!(help.max_scroll > 0);
+        let position = format!(" 1-{} of {} ", help.page, help.page + help.max_scroll);
+        assert!(
+            screen.contains(&position),
+            "{position:?} missing:\n{screen}"
+        );
+        assert!(screen.contains("↑/↓ scroll · Esc close"), "{screen}");
+        assert!(!screen.contains("Quit."), "{screen}");
+        app.press(Key::End);
+        let screen = render(&mut app, 80, 12);
+        assert!(screen.contains("Quit."), "{screen}");
+    }
+
+    #[test]
     fn tiny_terminal_does_not_panic() {
         let (_home, mut app) = fixture_app();
         for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0)] {
             let _ = render(&mut app, width, height);
             app.press(Key::Char('e'));
+            let _ = render(&mut app, width, height);
+            app.press(Key::Esc);
+            app.press(Key::Char('?'));
             let _ = render(&mut app, width, height);
             app.press(Key::Esc);
         }

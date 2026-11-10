@@ -138,6 +138,7 @@ pub enum Action {
     EditEffort,
     SaveEffort,
     Recheck,
+    Help,
     Launch,
     Quit,
 }
@@ -154,6 +155,7 @@ pub fn action_for(key: Key) -> Option<Action> {
         Key::Char('e') => Action::EditEffort,
         Key::Char('s') => Action::SaveEffort,
         Key::Char('r') => Action::Recheck,
+        Key::Char('?') => Action::Help,
         Key::Enter => Action::Launch,
         Key::Esc | Key::Char('q') | Key::Ctrl('c') => Action::Quit,
         _ => return None,
@@ -226,6 +228,8 @@ pub struct App {
     codex_path: Option<PathBuf>,
     extra_args: Vec<String>,
     pub effort_picker: Option<EffortPicker>,
+    /// The help screen's position, while it is open.
+    pub help: Option<Scroll>,
     selected: usize,
     status: Status,
     home: Option<PathBuf>,
@@ -280,6 +284,7 @@ impl App {
             codex_path: crate::launch::find_executable(crate::launch::CODEX, path),
             extra_args: extra_args.to_vec(),
             effort_picker: None,
+            help: None,
             selected: 0,
             status: Status::Selecting,
             home,
@@ -563,8 +568,28 @@ impl App {
             self.press_effort_picker(key);
             return;
         }
+        if self.help.is_some() {
+            self.press_help(key);
+            return;
+        }
         if let Some(action) = action_for(key) {
             self.apply(action);
+        }
+    }
+
+    /// While the help is open, keys scroll or close it, and Ctrl-C quits.
+    fn press_help(&mut self, key: Key) {
+        let help = self.help.as_mut().unwrap();
+        match key {
+            Key::Up | Key::Char('k') => help.up(1),
+            Key::Down | Key::Char('j') => help.down(1),
+            Key::PageUp => help.up(help.page_step()),
+            Key::PageDown => help.down(help.page_step()),
+            Key::Home | Key::Char('g') => help.scroll = 0,
+            Key::End | Key::Char('G') => help.scroll = help.max_scroll,
+            Key::Char('?') | Key::Enter | Key::Esc | Key::Char('q') => self.help = None,
+            Key::Ctrl('c') => self.apply(Action::Quit),
+            _ => {}
         }
     }
 
@@ -587,6 +612,10 @@ impl App {
                 }
             }
             Action::Recheck => self.check_servers(),
+            Action::Help => {
+                self.help = Some(Scroll::default());
+                self.notice = None;
+            }
             Action::Launch => self.status = Status::Launching(self.command().clone()),
             Action::Quit => self.status = Status::Quitting,
         }
@@ -649,6 +678,7 @@ impl App {
             effort_override: self.effort_overrides[self.selected]
                 .as_ref()
                 .map(|s| s.value.as_str()),
+            help: self.help.as_ref(),
             notice: self.notice.as_deref(),
             details: &self.view.details,
             warnings: &self.catalog.warnings,
@@ -707,6 +737,7 @@ pub struct StateView<'a> {
     pub effort_choices: &'a Choices,
     pub effort_picker: Option<&'a EffortPicker>,
     pub effort_override: Option<&'a str>,
+    pub help: Option<&'a Scroll>,
     pub notice: Option<&'a str>,
     pub details: &'a Scroll,
     pub warnings: &'a [String],
@@ -918,6 +949,52 @@ mod tests {
         app.press(Key::Up);
         assert_eq!(app.selected(), 2);
         assert!(app.select_name("default").is_err());
+    }
+
+    #[test]
+    fn help_takes_keys_until_it_closes() {
+        let (_home, mut app) = fixture_app();
+        app.press(Key::Char('?'));
+        let help = app.help.as_mut().unwrap();
+        help.max_scroll = 5;
+        help.page = 3;
+        for (key, scroll) in [
+            (Key::Down, 1),
+            (Key::PageDown, 3),
+            (Key::End, 5),
+            (Key::Char('k'), 4),
+            (Key::PageUp, 2),
+            (Key::Home, 0),
+        ] {
+            app.press(key);
+            assert_eq!(app.help.as_ref().unwrap().scroll, scroll, "{key:?}");
+        }
+        app.press(Key::Char('e'));
+        assert!(app.effort_picker.is_none());
+        let instance = Instance {
+            pid: 42,
+            mode: "headless",
+            tty: None,
+            cwd: None,
+        };
+        let state = serde_json::to_value(app.state(&instance)).unwrap();
+        assert_eq!(
+            state["help"],
+            serde_json::json!({"scroll": 0, "max_scroll": 5})
+        );
+        assert_eq!(state["selected"], "default");
+
+        for key in [Key::Char('?'), Key::Enter, Key::Esc, Key::Char('q')] {
+            let (_home, mut app) = fixture_app();
+            app.press(Key::Char('?'));
+            app.press(key);
+            assert!(app.help.is_none(), "{key:?}");
+            assert_eq!(app.status(), &Status::Selecting, "{key:?}");
+            let state = serde_json::to_value(app.state(&instance)).unwrap();
+            assert!(state["help"].is_null(), "{key:?}");
+        }
+        app.press(Key::Ctrl('c'));
+        assert_eq!(app.status(), &Status::Quitting);
     }
 
     #[test]
