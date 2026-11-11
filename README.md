@@ -128,7 +128,8 @@ profile:
 | `◉` | busy | The status command says the server is busy with other work. |
 | `!` | model missing | The server answered without the model. |
 | `?` | reachable | The server answered, but not with a model list. |
-| `✗` | down | No answer, an HTTP 5xx error, refused credentials, or a status command that fails or says down. |
+| `?` | unknown | The status helper could not determine availability; the details explain why. |
+| `✗` | down | No answer, an HTTP 5xx error, refused credentials, or a status command reporting down. |
 | `…` | checking | The server or status command has not answered yet. |
 
 Press `?` in the menu to see these marks explained beside the list:
@@ -177,7 +178,7 @@ password. It prints one JSON object:
 {"state": "busy", "message": "another session is using the server", "context_window": 131072, "drafting": "on"}
 ```
 
-`state` is `ready`, `starts_on_launch`, `busy`, or `down`, and sets the
+`state` is `ready`, `starts_on_launch`, `busy`, `unknown`, or `down`, and sets the
 profile's mark. The other fields are optional:
 
 - `message` is a string that follows the state on the `server` line.
@@ -188,10 +189,35 @@ profile's mark. The other fields are optional:
   draft model's name, shown on a `drafting` line.
 
 The command has ten seconds to finish, and its stderr is discarded. If it
-fails, prints anything else, or runs out of time, the profile is marked down
+fails, prints anything else, or runs out of time, the profile is marked unknown
 and the `server` line says why. It runs in its own process group, which is
 killed once it finishes or runs out of time, or when you launch a profile or
 quit first, so its subprocesses do not keep running.
+
+Profiles with exactly the same status program and arguments share one run per
+check round. To inspect a host once but return different results per profile,
+give those profiles a shared command without `{profile}` in its arguments:
+
+```toml
+[[wrapper]]
+profiles = ["worker", "worker-fast"]
+launch = ["~/bin/worker", "{profile}"]
+status = ["~/bin/worker", "--status-all"]
+```
+
+That command can return a `profiles` object keyed by profile name instead of
+a single report:
+
+```json
+{"profiles":{"worker":{"state":"starts_on_launch","drafting":"off"},"worker-fast":{"state":"busy","message":"another session owns the host"}}}
+```
+
+A missing entry becomes `unknown`; a malformed or ambiguous report makes the
+shared check unknown. A single report still applies to every profile sharing
+the command, which is useful when SSH fails for the entire host. Pressing `r`
+runs a fresh round; reports are not cached between rounds. Status is advisory:
+the launch command must recheck ownership because another session can start
+after the menu's check.
 
 For example, a wrapper that opens an SSH tunnel through a shared connection
 could come with this status command:
