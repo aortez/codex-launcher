@@ -1300,6 +1300,148 @@ fn status_commands_report_for_wrappers_without_running_them() {
 }
 
 #[test]
+fn codex_launcher_toml_names_launch_and_status_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let codex_home = home.path().join(".codex");
+    std::fs::create_dir(&codex_home).unwrap();
+    for name in ["alpha", "beta", "plain"] {
+        std::fs::write(
+            codex_home.join(format!("{name}.config.toml")),
+            "model = 'm'\n",
+        )
+        .unwrap();
+    }
+    let launched = home.path().join("launched");
+    let executable = |path: PathBuf, text: String| {
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    // One script serves both profiles, and reports instead with --status. The
+    // PATH holds nothing else, so it uses only shell built-ins.
+    std::fs::create_dir(home.path().join("bin")).unwrap();
+    let run = home.path().join("bin/run");
+    executable(
+        run.clone(),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --status ]; then\n  printf '{{\"state\": \"busy\", \"message\": \"%s is busy\"}}' \"$2\"\nelse\n  : > {launched:?}\nfi\n"
+        ),
+    );
+    // The file takes precedence over these.
+    let bin = tempfile::tempdir().unwrap();
+    executable(
+        bin.path().join("codex-alpha"),
+        format!("#!/bin/sh\n: > {launched:?}\n"),
+    );
+    executable(
+        bin.path().join("codex-alpha.status"),
+        "#!/bin/sh\nprintf '{\"state\": \"ready\"}'\n".to_owned(),
+    );
+    std::fs::write(
+        codex_home.join("codex-launcher.toml"),
+        r#"
+[[wrapper]]
+profiles = ["alpha", "beta", "missing"]
+launch = ["~/bin/run", "{profile}"]
+status = ["~/bin/run", "--status", "{profile}"]
+
+[[wrapper]]
+profiles = ["plain"]
+launch = ["~/bin/absent"]
+"#,
+    )
+    .unwrap();
+    let launcher = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home.path())
+            .env("PATH", bin.path())
+            .output()
+            .unwrap()
+    };
+
+    let output = launcher(&["list", "--check", "--json"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "codex-launcher: warning: codex-launcher.toml: wrapper 1: no profile is named \"missing\"\n"
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = |profile: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == profile)
+            .unwrap()
+            .clone()
+    };
+    let run_path = run.to_str().unwrap();
+    let alpha = entry("alpha");
+    assert_eq!(
+        alpha["server"],
+        serde_json::json!({"state": "busy", "message": "alpha is busy"})
+    );
+    assert_eq!(alpha["command"], serde_json::json!([run_path, "alpha"]));
+    assert_eq!(alpha["wrapper"], run_path);
+    assert_eq!(
+        alpha["status_command"],
+        format!("{run_path} --status alpha")
+    );
+    assert_eq!(entry("beta")["server"]["message"], "beta is busy");
+    assert_eq!(
+        entry("plain")["server"],
+        serde_json::json!({"state": "skipped", "message": "launched through absent, and codex-launcher.toml gives it no status command"})
+    );
+
+    let output = launcher(&["plain"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "codex-launcher: cannot run {}: No such file or directory (os error 2)\n",
+            home.path().join("bin/absent").display()
+        )
+    );
+
+    // An effort override goes after the wrapper's own arguments.
+    let menu = Headless::launch(
+        &codex_home,
+        &["--no-check", "--", "exec", "hi"],
+        bin.path(),
+        &[("HOME", home.path().to_str())],
+    );
+    menu.ctl_json(&["select", "alpha"]);
+    let state = menu.ctl_json(&["effort", "high"]);
+    assert_eq!(
+        state["profile"]["command"],
+        serde_json::json!([
+            run_path,
+            "alpha",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "exec",
+            "hi"
+        ])
+    );
+    let screen = String::from_utf8(menu.ctl(&["screen"]).stdout).unwrap();
+    for expected in [
+        "launch    ~/bin/run alpha -c 'model_reasoning_effort=\"high\"' exec hi",
+        "status    ~/bin/run --status alpha",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+    assert!(!screen.contains("wrapper "), "{screen}");
+    menu.ctl_json(&["launch"]);
+    assert_eq!(
+        menu.finish(),
+        format!("{run_path} alpha -c 'model_reasoning_effort=\"high\"' exec hi\n")
+    );
+    assert!(!launched.exists(), "a server check ran a wrapper");
+}
+
+#[test]
 fn quitting_stops_status_commands_that_are_still_running() {
     use rustix::process::{Pid, Signal, kill_process};
     use std::os::unix::fs::PermissionsExt;

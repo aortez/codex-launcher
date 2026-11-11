@@ -11,6 +11,7 @@ mod profile;
 mod provider;
 mod tui;
 mod ui;
+mod wrappers;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -36,6 +37,7 @@ Profiles are $CODEX_HOME/<name>.config.toml files (CODEX_HOME defaults to
 named codex-<name> is on PATH, launching <name> runs it instead of
 `codex --profile <name>`; the wrapper must select the profile itself. Server
 checks never run a wrapper, but run codex-<name>.status when it is on PATH.
+$CODEX_HOME/codex-launcher.toml can name both commands instead; see the README.
 
 In the menu, press ? to see what the keys and the server marks mean.
 

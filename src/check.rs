@@ -4,12 +4,13 @@
 //! headers. Ollama, vLLM, llama.cpp, and most gateways serve this
 //! OpenAI-compatible list, and reading it does not load a model.
 //!
-//! A profile with a `codex-<name>.status` command on `PATH` runs that command
-//! instead, and it reports the server's state itself. The check never runs a
-//! profile's wrapper, which may start a server.
+//! A profile with a status command, from codex-launcher.toml or as
+//! `codex-<name>.status` on `PATH`, runs that command instead, and it reports
+//! the server's state itself. The check never runs a profile's wrapper, which
+//! may start a server.
 
 use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::launch::{self, Command};
+use crate::launch::{self, Command, Program};
 use crate::process::{self, Outcome};
 use crate::profile::{Catalog, Profile};
 use crate::provider;
@@ -116,7 +117,7 @@ enum Probe {
     /// Ask a server for its model list, with these headers.
     Models(&'static Client, Url, HeaderMap),
     /// Run a profile's status command.
-    Status(PathBuf),
+    Status(Program),
 }
 
 impl Probe {
@@ -126,7 +127,7 @@ impl Probe {
             (Self::Models(_, url, headers), Self::Models(_, other_url, other_headers)) => {
                 url == other_url && headers == other_headers
             }
-            (Self::Status(path), Self::Status(other_path)) => path == other_path,
+            (Self::Status(command), Self::Status(other_command)) => command == other_command,
             _ => false,
         }
     }
@@ -134,7 +135,7 @@ impl Probe {
     fn run(self) -> Reply {
         match self {
             Self::Models(client, url, headers) => fetch(client, url, headers),
-            Self::Status(path) => Reply::Reported(run_status(&path, STATUS_TIMEOUT)),
+            Self::Status(command) => Reply::Reported(run_status(&command, STATUS_TIMEOUT)),
         }
     }
 }
@@ -195,10 +196,10 @@ impl Checks {
             .zip(commands)
             .map(|(profile, command)| {
                 let planned = match (&command.status, &client) {
-                    (Some(path), _) => match &selected {
+                    (Some(status), _) => match &selected {
                         Some(reason) => Err(reason.clone()),
                         // A status command's report needs no model to compare.
-                        None => Ok((Probe::Status(path.clone()), String::new())),
+                        None => Ok((Probe::Status(status.clone()), String::new())),
                     },
                     (None, Ok(client)) => request(profile, command, &catalog.codex_home, args)
                         .map(|(url, headers, model)| (Probe::Models(client, url, headers), model)),
@@ -290,12 +291,20 @@ fn request(
     args: &[String],
 ) -> Result<(Url, HeaderMap, String), String> {
     // A wrapper may start the server or load credentials before Codex runs.
-    if command.wrapper.is_some() {
-        return Err(format!(
-            "launched through {}, and no {} is on PATH",
-            command.program,
-            launch::status_name(&profile.name)
-        ));
+    if let Some(wrapper) = &command.wrapper {
+        return Err(if profile.wrapper.is_some() {
+            format!(
+                "launched through {}, and {} gives it no status command",
+                file_name(wrapper),
+                crate::wrappers::FILE_NAME
+            )
+        } else {
+            format!(
+                "launched through {}, and no {} is on PATH",
+                command.program,
+                launch::status_name(&profile.name)
+            )
+        });
     }
     let (config, model) = provider::effective_config(profile, codex_home, args)
         .map_err(|error| format!("{error:#}"))?;
@@ -324,15 +333,21 @@ enum ReportedState {
     Down,
 }
 
-/// Run a profile's status command and read its report.
-fn run_status(path: &Path, timeout: Duration) -> Status {
-    let name = path.file_name().map_or_else(
+/// The last part of `path`, for messages.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
-    );
+    )
+}
+
+/// Run a profile's status command and read its report.
+fn run_status(status: &Program, timeout: Duration) -> Status {
+    let name = file_name(&status.path);
     // A parse error may quote the command's output, so clean it up too.
     let down = |reason: String| Status::new(State::Down, reported_text(&reason));
-    let mut command = std::process::Command::new(path);
+    let mut command = std::process::Command::new(&status.path);
+    command.args(&status.args);
     match process::run(&mut command, Instant::now() + timeout, MAX_STATUS_BYTES) {
         Ok(Outcome::Exited(exit, bytes)) if exit.success() => parse_status(&bytes)
             .unwrap_or_else(|error| down(format!("{name} printed no valid status: {error}"))),
@@ -646,7 +661,13 @@ mod tests {
             let path = dir.path().join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let status = run_status(&path, timeout);
+            let status = run_status(
+                &Program {
+                    path,
+                    args: Vec::new(),
+                },
+                timeout,
+            );
             (status.state, status.message.unwrap_or_default())
         };
         // Leave a slow machine time to start the shell, except for the hang.
@@ -698,6 +719,30 @@ mod tests {
                 State::Down,
                 "codex-hangs.status did not finish within 500ms".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn status_commands_get_their_arguments_one_by_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nIFS='|'\nprintf '{\"state\": \"busy\", \"message\": \"%s\"}' \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = run_status(
+            &Program {
+                path,
+                args: vec!["--status".to_owned(), "two words".to_owned()],
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            status,
+            Status::new(State::Busy, Some("--status|two words".to_owned()))
         );
     }
 }

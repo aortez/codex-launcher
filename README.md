@@ -60,6 +60,28 @@ details pane shows the command and the wrapper's path. Server checks never run
 a wrapper; a [status command](#status-commands) can report on its server
 instead.
 
+To name the commands yourself, or to let one script serve several profiles,
+list them in `$CODEX_HOME/codex-launcher.toml`:
+
+```toml
+[[wrapper]]
+profiles = ["lab", "lab-large"]
+launch = ["~/bin/lab-codex", "{profile}"]
+status = ["~/bin/lab-codex", "--status", "{profile}"]
+```
+
+Each command is a program, then its arguments. `{profile}` becomes the
+profile's name, and the program must be an absolute path or start with `~/`.
+Launching `lab` runs `~/bin/lab-codex lab`, followed by any Codex arguments,
+including an [effort](#changing-effort) override. `status` is the profile's
+status command. An entry may give either command alone; without `launch`, the
+profile runs `codex --profile <name>`. A profile that the file names ignores
+`codex-<name>` and `codex-<name>.status` on `PATH`. The launcher reads the
+file when it starts, and warns about names that are not profiles, `default`,
+profiles named twice, and commands it cannot use.
+
+![The details pane for lab, which one script launches and checks for both lab profiles](docs/images/wrappers.png)
+
 ## Usage
 
 ```sh
@@ -136,13 +158,15 @@ profile or provider.
 ### Status commands
 
 To check a profile your own way, such as one launched through a wrapper, put an
-executable named `codex-<name>.status` on `PATH`. The check then runs it
-instead of asking the server for its model list, and the details pane shows its
-path on a `status` line. The launcher looks for status commands when it starts,
+executable named `codex-<name>.status` on `PATH`, or give the profile a
+`status` command in [`codex-launcher.toml`](#wrappers). The check then runs it
+instead of asking the server for its model list, and the details pane shows it
+on a `status` line. The launcher looks for status commands when it starts,
 and only in absolute `PATH` entries, so a `.` entry never runs one from the
 current directory.
 
-The command runs with no arguments or input. It must report without starting or
+The command runs with no input, and with only the arguments that
+`codex-launcher.toml` gives it. It must report without starting or
 changing anything, and without using the terminal, which it shares with the
 menu: give `ssh` `-o BatchMode=yes`, so that it fails instead of asking for a
 password. It prints one JSON object:

@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Scroll};
 use crate::check::{State, Status};
+use crate::launch::shell_quote;
 use crate::profile::{Profile, Setting, Source};
 
 const LABEL_WIDTH: usize = 10;
@@ -400,12 +401,28 @@ pub fn details(app: &App) -> Text<'static> {
     }
     lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
     lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
-    lines.push(row("launch", command.display(), ""));
-    if let Some(wrapper) = &command.wrapper {
-        lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
+    match &command.wrapper {
+        // The launch command already names a wrapper from codex-launcher.toml.
+        Some(wrapper) if profile.wrapper.is_some() => {
+            lines.push(row(
+                "launch",
+                command_line(wrapper, &command.args, app.home()),
+                "",
+            ));
+        }
+        wrapper => {
+            lines.push(row("launch", command.display(), ""));
+            if let Some(wrapper) = wrapper {
+                lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
+            }
+        }
     }
-    if let Some(path) = &command.status {
-        lines.push(row("status", display_path(path, app.home()), ""));
+    if let Some(status) = &command.status {
+        lines.push(row(
+            "status",
+            command_line(&status.path, &status.args, app.home()),
+            "",
+        ));
     }
 
     let file_name = profile
@@ -521,6 +538,15 @@ fn row(label: &str, value: String, tag: &str) -> Line<'static> {
 }
 
 /// Show `path` relative to `home` as `~/...` when it is inside it.
+/// A program and its shell-quoted arguments, with the program shortened like
+/// [`display_path`].
+fn command_line(program: &Path, args: &[String], home: Option<&Path>) -> String {
+    std::iter::once(display_path(program, home))
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) => format!("~/{}", rest.display()),
