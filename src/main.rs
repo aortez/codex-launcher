@@ -6,6 +6,7 @@ mod control;
 mod effort;
 mod launch;
 mod ollama;
+mod process;
 mod profile;
 mod provider;
 mod tui;
