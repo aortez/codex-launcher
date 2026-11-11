@@ -21,6 +21,9 @@ pub struct Command {
     pub args: Vec<String>,
     /// The resolved `codex-<profile>` wrapper, when one is on `PATH`.
     pub wrapper: Option<PathBuf>,
+    /// The resolved `codex-<profile>.status` command, when one is on `PATH`.
+    /// Server checks run it instead of asking the server themselves.
+    pub status: Option<PathBuf>,
 }
 
 impl Command {
@@ -56,10 +59,13 @@ impl Command {
     /// when that executable is on `path`. The wrapper is expected to select the
     /// profile itself.
     pub fn for_profile(profile: &Profile, extra: &[String], path: Option<&OsStr>) -> Self {
-        let wrapper = if profile.is_default() {
-            None
+        let (wrapper, status) = if profile.is_default() {
+            (None, None)
         } else {
-            find_wrapper(&profile.name, path)
+            (
+                find_wrapper(&profile.name, path),
+                find_status(&profile.name, path),
+            )
         };
         let mut args = Vec::new();
         let program = if wrapper.is_some() {
@@ -75,6 +81,7 @@ impl Command {
             program,
             args,
             wrapper,
+            status,
         }
     }
 
@@ -96,6 +103,9 @@ impl Command {
 
     /// Replace this process with the command. Returns only on failure.
     pub fn exec(&self) -> anyhow::Error {
+        // Codex inherits this process, but not the threads that would kill
+        // helpers such as status commands when they run out of time.
+        crate::process::stop_all();
         let program: &OsStr = match &self.wrapper {
             Some(path) => path.as_os_str(),
             None => OsStr::new(&self.program),
@@ -112,6 +122,12 @@ impl Command {
 /// The wrapper executable name for a profile.
 pub fn wrapper_name(profile: &str) -> String {
     format!("{CODEX}-{profile}")
+}
+
+/// The status command's executable name for a profile. Profile names cannot
+/// contain a dot, so it never names another profile's wrapper.
+pub fn status_name(profile: &str) -> String {
+    format!("{}.status", wrapper_name(profile))
 }
 
 /// Codex arguments that select a profile.
@@ -131,6 +147,17 @@ fn find_wrapper(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     }
     let name = wrapper_name(profile);
     find_executable(&name, path)
+}
+
+/// Find an executable `codex-<profile>.status` on `path`. A status command
+/// runs as soon as the menu opens, so unlike a wrapper it never comes from a
+/// relative entry such as `.`, which would run what the current directory holds.
+fn find_status(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = status_name(profile);
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| is_executable(candidate))
 }
 
 pub fn find_executable(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
@@ -222,6 +249,39 @@ mod tests {
 
         let launcher = Command::for_profile(catalog.find("launcher").unwrap(), &[], Some(&path));
         assert_eq!(launcher.argv(), ["codex", "--profile", "launcher"]);
+    }
+
+    #[test]
+    fn status_command_comes_from_path_for_named_profiles() {
+        let (_home, catalog) = catalog(&["work"]);
+        let bin = tempfile::tempdir().unwrap();
+        executable(bin.path(), "codex-work.status");
+        executable(bin.path(), "codex-default.status");
+        let path = Some(bin.path().as_os_str());
+
+        let work = Command::for_profile(catalog.find("work").unwrap(), &[], path);
+        assert_eq!(work.status, Some(bin.path().join("codex-work.status")));
+        // A status command does not change what launching runs.
+        assert_eq!(work.argv(), ["codex", "--profile", "work"]);
+
+        let default = Command::for_profile(catalog.find("default").unwrap(), &[], path);
+        assert_eq!(default.status, None);
+
+        // The same directory, named relative to the current one.
+        let relative: PathBuf = std::env::current_dir()
+            .unwrap()
+            .components()
+            .skip(1)
+            .map(|_| "..")
+            .collect::<PathBuf>()
+            .join(bin.path().strip_prefix("/").unwrap());
+        assert!(is_executable(&relative.join("codex-work.status")));
+        let work = Command::for_profile(
+            catalog.find("work").unwrap(),
+            &[],
+            Some(relative.as_os_str()),
+        );
+        assert_eq!(work.status, None);
     }
 
     #[test]

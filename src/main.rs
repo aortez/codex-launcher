@@ -6,6 +6,7 @@ mod control;
 mod effort;
 mod launch;
 mod ollama;
+mod process;
 mod profile;
 mod provider;
 mod tui;
@@ -33,7 +34,8 @@ const AFTER_HELP: &str = "\
 Profiles are $CODEX_HOME/<name>.config.toml files (CODEX_HOME defaults to
 ~/.codex). \"default\" runs Codex with config.toml alone. When an executable
 named codex-<name> is on PATH, launching <name> runs it instead of
-`codex --profile <name>`; the wrapper must select the profile itself.
+`codex --profile <name>`; the wrapper must select the profile itself. Server
+checks never run a wrapper, but run codex-<name>.status when it is on PATH.
 
 In the menu, press ? to see what the keys and the server marks mean.
 
@@ -214,13 +216,17 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    match run(cli) {
+    let code = match run(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("codex-launcher: {error:#}");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Helpers that are still running, such as status commands that have yet
+    // to answer, would outlive the launcher.
+    process::stop_all();
+    code
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {

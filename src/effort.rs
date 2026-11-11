@@ -1,16 +1,16 @@
 //! Effort discovery through Codex, with local metadata as a fallback.
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::process::{self, Outcome};
 use crate::profile::{self, Profile};
 
 const COMMON_LEVELS: &[&str] = &[
@@ -215,52 +215,22 @@ fn query_catalog(
         Some(profile_snapshot(codex_home, &config.to_string())?)
     };
     let query_home = snapshot.as_ref().map_or(codex_home, |dir| dir.path());
-    let mut output = tempfile::tempfile()?;
     if Instant::now() >= deadline {
         return Err(query_timeout());
     }
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    command
         .args(["debug", "models"])
         .args(config_args)
-        .env("CODEX_HOME", query_home)
-        .stdin(Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
-    let process_group = rustix::process::Pid::from_child(&child);
-    let result = (|| {
-        loop {
-            if output.metadata()?.len() > MAX_CATALOG_BYTES {
-                bail!("model catalog is too large");
-            }
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("codex debug models failed");
-                }
-                output.seek(SeekFrom::Start(0))?;
-                let mut bytes = Vec::new();
-                (&mut output)
-                    .take(MAX_CATALOG_BYTES + 1)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() as u64 > MAX_CATALOG_BYTES {
-                    bail!("model catalog is too large");
-                }
-                return Ok((serde_json::from_slice(&bytes)?, model));
-            }
-            if Instant::now() >= deadline {
-                return Err(query_timeout());
-            }
-            std::thread::sleep(
-                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-            );
+        .env("CODEX_HOME", query_home);
+    match process::run(&mut command, deadline, MAX_CATALOG_BYTES)? {
+        Outcome::Exited(status, bytes) if status.success() => {
+            Ok((serde_json::from_slice(&bytes)?, model))
         }
-    })();
-    // Wrappers may leave descendants behind even after they exit. Terminate
-    // the isolated group on every path, then reap the immediate child.
-    let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
-    let _ = child.wait();
-    result
+        Outcome::Exited(..) => bail!("codex debug models failed"),
+        Outcome::TooLarge => bail!("model catalog is too large"),
+        Outcome::TimedOut => Err(query_timeout()),
+    }
 }
 
 fn query_timeout() -> anyhow::Error {

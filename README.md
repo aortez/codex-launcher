@@ -56,7 +56,9 @@ Some profiles need setup before Codex starts, such as a tunnel or an API key
 loaded from a file. If an executable named `codex-<name>` is on `PATH`,
 launching profile `<name>` runs it, with any extra arguments, instead of
 `codex --profile <name>`. The wrapper must select the profile itself. The
-details pane shows the command and the wrapper's path.
+details pane shows the command and the wrapper's path. Server checks never run
+a wrapper; a [status command](#status-commands) can report on its server
+instead.
 
 ## Usage
 
@@ -91,16 +93,19 @@ process with Codex, so Codex gets the terminal and nothing is left running.
 ### Server checks
 
 A profile works only if its model server is running and has the model. When the
-menu opens, it asks each profile's server for its model list in the background
-and marks the profile:
+menu opens, it asks each profile's server for its model list, or runs the
+profile's [status command](#status-commands), in the background and marks the
+profile:
 
 | Mark | State | Meaning |
 | --- | --- | --- |
-| `✓` | ready | The server lists the profile's model. |
+| `✓` | ready | The server lists the profile's model, or its status command says ready. |
+| `◌` | starts on launch | The status command says launching starts the server. |
+| `◉` | busy | The status command says the server is busy with other work. |
 | `!` | model missing | The server answered without the model. |
 | `?` | reachable | The server answered, but not with a model list. |
-| `✗` | down | No answer, an HTTP 5xx error, or refused credentials. |
-| `…` | checking | The server has not answered yet. |
+| `✗` | down | No answer, an HTTP 5xx error, refused credentials, or a status command that fails or says down. |
+| `…` | checking | The server or status command has not answered yet. |
 
 Press `?` in the menu to see these marks explained beside the list:
 
@@ -122,10 +127,58 @@ The base URL need not end in `/v1`. A model name without a tag also matches
 Ollama's `<name>:latest`.
 
 Profiles without a mark are not checked, and their `server` line says why. This
-covers profiles launched through a wrapper, which may start the server or load
-credentials first; built-in providers other than `ollama`, such as `openai`;
-providers with `requires_openai_auth`; providers whose `env_key` variable is
-unset; and launch arguments that select a profile or provider.
+covers profiles launched through a wrapper without a status command, since the
+wrapper may start the server or load credentials first; built-in providers
+other than `ollama`, such as `openai`; providers with `requires_openai_auth`;
+providers whose `env_key` variable is unset; and launch arguments that select a
+profile or provider.
+
+### Status commands
+
+To check a profile your own way, such as one launched through a wrapper, put an
+executable named `codex-<name>.status` on `PATH`. The check then runs it
+instead of asking the server for its model list, and the details pane shows its
+path on a `status` line. The launcher looks for status commands when it starts,
+and only in absolute `PATH` entries, so a `.` entry never runs one from the
+current directory.
+
+The command runs with no arguments or input. It must report without starting or
+changing anything, and without using the terminal, which it shares with the
+menu: give `ssh` `-o BatchMode=yes`, so that it fails instead of asking for a
+password. It prints one JSON object:
+
+```json
+{"state": "busy", "message": "another session is using the server", "context_window": 131072, "drafting": "on"}
+```
+
+`state` is `ready`, `starts_on_launch`, `busy`, or `down`, and sets the
+profile's mark. The other fields are optional:
+
+- `message` is a string that follows the state on the `server` line.
+- `context_window` is the context the server allocates, as a whole number of
+  tokens. When it differs from `model_context_window`, the `context` line says
+  so in yellow.
+- `drafting` is a string about the server's draft model, such as `on` or the
+  draft model's name, shown on a `drafting` line.
+
+The command has ten seconds to finish, and its stderr is discarded. If it
+fails, prints anything else, or runs out of time, the profile is marked down
+and the `server` line says why. It runs in its own process group, which is
+killed once it finishes or runs out of time, or when you launch a profile or
+quit first, so its subprocesses do not keep running.
+
+For example, a wrapper that opens an SSH tunnel through a shared connection
+could come with this status command:
+
+```sh
+#!/bin/sh
+# codex-work.status: report on the tunnel that codex-work opens.
+if ssh -O check work-tunnel 2>/dev/null; then
+  echo '{"state": "ready", "message": "the tunnel is open"}'
+else
+  echo '{"state": "starts_on_launch", "message": "codex-work opens the tunnel"}'
+fi
+```
 
 ### Changing effort
 
@@ -248,8 +301,10 @@ contains save feedback or a keyboard-action error, when present. Invalid
 `ctl effort` values fail without changing the current choice.
 
 `profile.server` reports the selected profile's server check: its `state`
-(`checking`, `ready`, `model_missing`, `reachable`, `down`, or `skipped`) and a
-`message` with the reason, or null. Each `menu` entry has its `server` state.
+(`checking`, `ready`, `starts_on_launch`, `busy`, `model_missing`, `reachable`,
+`down`, or `skipped`) and a `message` with the reason, or null. A status
+command's `context_window` and `drafting` appear there too, when it reports
+them. Each `menu` entry has its `server` state.
 `ctl key r` checks again; read `ctl state` until no entry is `checking`. With
 `--no-check`, these fields are absent until the first check.
 `list --check --json` adds the same `server` object to each profile.

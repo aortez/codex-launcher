@@ -27,8 +27,19 @@ const OVERRIDE_HINTS: &str = "e effort · s save effort · Enter launch · ? hel
 const MIN_MEANING_WIDTH: usize = 20;
 
 /// What each server mark means, in the order the help lists them.
-const MARKS: [(State, &str); 6] = [
-    (State::Ready, "The server lists the profile's model."),
+const MARKS: [(State, &str); 8] = [
+    (
+        State::Ready,
+        "The server lists the profile's model, or its status command says ready.",
+    ),
+    (
+        State::StartsOnLaunch,
+        "The status command says launching starts the server.",
+    ),
+    (
+        State::Busy,
+        "The status command says the server is busy with other work.",
+    ),
     (
         State::ModelMissing,
         "The server answered without the model.",
@@ -39,9 +50,12 @@ const MARKS: [(State, &str); 6] = [
     ),
     (
         State::Down,
-        "No answer, a 5xx error, or refused credentials.",
+        "No answer, a 5xx error, refused credentials, or a failed status command.",
     ),
-    (State::Checking, "The server has not answered yet."),
+    (
+        State::Checking,
+        "The server or status command has not answered yet.",
+    ),
     (State::Skipped, "The details pane's server line says why."),
 ];
 
@@ -353,24 +367,45 @@ pub fn details(app: &App) -> Text<'static> {
     if let Some(url) = &profile.provider.base_url {
         lines.push(row("url", url.clone(), ""));
     }
-    if let Some(status) = app.server_status() {
+    let server = app.server_status();
+    if let Some(status) = server {
         lines.push(server_line(status));
     }
     lines.push(setting_line(profile, "effort", app.effective_effort()));
-    // Most profiles leave these to Codex, so they show only when a layer sets them.
-    for (label, setting) in [
-        ("context", &profile.context_window),
-        ("compact", &profile.auto_compact_token_limit),
-    ] {
-        if setting.is_some() {
-            lines.push(setting_line(profile, label, setting.as_ref()));
+    // Most profiles leave these to Codex, so each shows only when a layer sets
+    // it. The context also shows when a status command reports the server's.
+    let allocated = server.and_then(|status| status.context_window);
+    if profile.context_window.is_some() || allocated.is_some() {
+        let mut line = setting_line(profile, "context", profile.context_window.as_ref());
+        let configured = profile
+            .context_window
+            .as_ref()
+            .and_then(|setting| setting.value.parse::<u64>().ok());
+        if let Some(tokens) = allocated
+            && configured != Some(tokens)
+        {
+            line.push_span(Span::raw(format!("  server allocates {tokens}")).fg(Color::Yellow));
         }
+        lines.push(line);
+    }
+    if profile.auto_compact_token_limit.is_some() {
+        lines.push(setting_line(
+            profile,
+            "compact",
+            profile.auto_compact_token_limit.as_ref(),
+        ));
+    }
+    if let Some(drafting) = server.and_then(|status| status.drafting.clone()) {
+        lines.push(row("drafting", drafting, ""));
     }
     lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
     lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
     lines.push(row("launch", command.display(), ""));
     if let Some(wrapper) = &command.wrapper {
         lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
+    }
+    if let Some(path) = &command.status {
+        lines.push(row("status", display_path(path, app.home()), ""));
     }
 
     let file_name = profile
@@ -437,6 +472,9 @@ fn mark(state: Option<State>) -> Span<'static> {
     };
     let symbol = match state {
         State::Ready => "✓ ",
+        // Neither circle has an ambiguous width, so no terminal draws one wide.
+        State::StartsOnLaunch => "◌ ",
+        State::Busy => "◉ ",
         State::Reachable => "? ",
         State::ModelMissing => "! ",
         State::Down => "✗ ",
@@ -464,7 +502,8 @@ fn server_line(status: &Status) -> Line<'static> {
 fn state_style(state: State) -> Style {
     match state {
         State::Ready => Style::new().fg(Color::Green),
-        State::Reachable | State::ModelMissing => Style::new().fg(Color::Yellow),
+        State::StartsOnLaunch => Style::new().fg(Color::Cyan),
+        State::Busy | State::Reachable | State::ModelMissing => Style::new().fg(Color::Yellow),
         State::Down => Style::new().fg(Color::Red),
         State::Checking | State::Skipped => Style::new().add_modifier(Modifier::DIM),
     }
@@ -647,9 +686,11 @@ mod tests {
         for expected in [
             "│> default",
             "┌ Help ",
-            "✓ ready          The server lists the profile's model.",
-            "✗ down           No answer,",
-            "  not checked    The details pane's server line says why.",
+            "✓ ready             The server lists the profile's model,",
+            "◌ starts on launch  The status command says launching starts the server.",
+            "◉ busy              The status command says the server is busy with other work.",
+            "✗ down              No answer,",
+            "  not checked       The details pane's server line says why.",
             "Yellow profile names",
             "q, Esc, or Ctrl-C  Quit.",
         ] {
@@ -689,8 +730,8 @@ mod tests {
         // The widest list leaves the help 46 columns, so meanings wrap within
         // their column instead of back to the border.
         for expected in [
-            "│? reachable      The server answered, but not ",
-            "│                 with a model list. ",
+            "│? reachable         The server answered, but ",
+            "│                    not with a model list. ",
             "│s                  Save the chosen effort to ",
             "│                   the profile's file. ",
         ] {
