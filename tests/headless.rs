@@ -427,6 +427,10 @@ fn ctl_reads_and_drives_the_menu() {
     let state = launcher.ctl_json(&["select", "local"]);
     assert_eq!(state["selected"], "local");
     assert_eq!(state["profile"]["model"]["value"], "qwen3-coder:30b");
+    assert_eq!(
+        state["profile"]["auto_compact_token_limit"]["value"],
+        "57344"
+    );
 
     let screen = launcher.ctl(&["screen"]);
     let screen = String::from_utf8(screen.stdout).unwrap();

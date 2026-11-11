@@ -104,6 +104,7 @@ pub struct Profile {
     pub effort: Option<Setting>,
     pub model_catalog: Option<Setting>,
     pub context_window: Option<Setting>,
+    pub auto_compact_token_limit: Option<Setting>,
     pub sandbox: Option<Setting>,
     pub approval: Option<Setting>,
     /// The redacted file text, or `None` when the file does not exist.
@@ -392,6 +393,7 @@ fn build_profile(
         effort: setting(layer, base, "model_reasoning_effort"),
         model_catalog: setting(layer, base, "model_catalog_json"),
         context_window: setting(layer, base, "model_context_window"),
+        auto_compact_token_limit: setting(layer, base, "model_auto_compact_token_limit"),
         sandbox: setting(layer, base, "sandbox_mode"),
         approval: setting(layer, base, "approval_policy"),
         raw,

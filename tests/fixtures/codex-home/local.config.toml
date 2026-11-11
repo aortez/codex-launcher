@@ -3,3 +3,4 @@ model = "qwen3-coder:30b"
 model_provider = "ollama"
 model_reasoning_effort = "medium"
 model_context_window = 65536
+model_auto_compact_token_limit = 57344
