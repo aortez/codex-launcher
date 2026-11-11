@@ -9,6 +9,7 @@
 //! the server's state itself. The check never runs a profile's wrapper, which
 //! may start a server.
 
+use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -50,12 +51,14 @@ pub enum State {
     StartsOnLaunch,
     /// The status command says that the server is busy with other work.
     Busy,
+    /// The status helper could not determine whether the server is available.
+    Unknown,
     /// The server answered without a model list to compare.
     Reachable,
     /// The server lists other models, but not this one.
     ModelMissing,
     /// No answer, a server error, refused credentials, or a status command
-    /// that fails or says the server is down.
+    /// that says the server is down.
     Down,
     /// Not checked, for the reason in the message.
     Skipped,
@@ -69,6 +72,7 @@ impl State {
             Self::Ready => "ready",
             Self::StartsOnLaunch => "starts on launch",
             Self::Busy => "busy",
+            Self::Unknown => "unknown",
             Self::Reachable => "reachable",
             Self::ModelMissing => "model missing",
             Self::Down => "down",
@@ -108,8 +112,28 @@ enum Reply {
     Unlisted(String),
     /// No usable answer, and why.
     Down(String),
-    /// A status command's report, which needs no comparison.
-    Reported(Status),
+    /// A status command's reports, selected by profile when grouped.
+    Reported(Reports),
+}
+
+/// A helper can answer for one profile, or for all profiles on a host.
+enum Reports {
+    Single(Status),
+    Profiles(BTreeMap<String, Status>),
+}
+
+impl Reports {
+    fn for_profile(&self, name: &str) -> Status {
+        match self {
+            Self::Single(status) => status.clone(),
+            Self::Profiles(profiles) => profiles.get(name).cloned().unwrap_or_else(|| {
+                Status::new(
+                    State::Unknown,
+                    Some(format!("status report omitted {name}")),
+                )
+            }),
+        }
+    }
 }
 
 /// One request, which answers for every profile that waits on it.
@@ -143,7 +167,7 @@ impl Probe {
 /// The latest server check for each profile in a menu or listing.
 pub struct Checks {
     statuses: Vec<Option<Status>>,
-    /// The request that each checked profile waits on, and the model to find.
+    /// The request each profile waits on, and its model or reported profile name.
     targets: Vec<Option<(usize, String)>>,
     /// Replies to the current round. Replacing it discards older rounds.
     replies: Option<Receiver<(usize, Reply)>>,
@@ -198,8 +222,8 @@ impl Checks {
                 let planned = match (&command.status, &client) {
                     (Some(status), _) => match &selected {
                         Some(reason) => Err(reason.clone()),
-                        // A status command's report needs no model to compare.
-                        None => Ok((Probe::Status(status.clone()), String::new())),
+                        // A shared command may return a report for each profile.
+                        None => Ok((Probe::Status(status.clone()), profile.name.clone())),
                     },
                     (None, Ok(client)) => request(profile, command, &catalog.codex_home, args)
                         .map(|(url, headers, model)| (Probe::Models(client, url, headers), model)),
@@ -330,6 +354,7 @@ enum ReportedState {
     Ready,
     StartsOnLaunch,
     Busy,
+    Unknown,
     Down,
 }
 
@@ -342,37 +367,63 @@ fn file_name(path: &Path) -> String {
 }
 
 /// Run a profile's status command and read its report.
-fn run_status(status: &Program, timeout: Duration) -> Status {
+fn run_status(status: &Program, timeout: Duration) -> Reports {
     let name = file_name(&status.path);
     // A parse error may quote the command's output, so clean it up too.
-    let down = |reason: String| Status::new(State::Down, reported_text(&reason));
+    let unknown =
+        |reason: String| Reports::Single(Status::new(State::Unknown, reported_text(&reason)));
     let mut command = std::process::Command::new(&status.path);
     command.args(&status.args);
     match process::run(&mut command, Instant::now() + timeout, MAX_STATUS_BYTES) {
-        Ok(Outcome::Exited(exit, bytes)) if exit.success() => parse_status(&bytes)
-            .unwrap_or_else(|error| down(format!("{name} printed no valid status: {error}"))),
-        Ok(Outcome::Exited(exit, _)) => down(format!("{name} failed ({exit})")),
-        Ok(Outcome::TooLarge) => down(format!("{name} printed too much")),
-        Ok(Outcome::TimedOut) => down(format!("{name} did not finish within {timeout:?}")),
-        Err(error) => down(format!("cannot run {name}: {error}")),
+        Ok(Outcome::Exited(exit, bytes)) if exit.success() => parse_reports(&bytes)
+            .unwrap_or_else(|error| unknown(format!("{name} printed no valid status: {error}"))),
+        Ok(Outcome::Exited(exit, _)) => unknown(format!("{name} failed ({exit})")),
+        Ok(Outcome::TooLarge) => unknown(format!("{name} printed too much")),
+        Ok(Outcome::TimedOut) => unknown(format!("{name} did not finish within {timeout:?}")),
+        Err(error) => unknown(format!("cannot run {name}: {error}")),
+    }
+}
+
+fn parse_reports(bytes: &[u8]) -> Result<Reports, serde_json::Error> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    if let Some(profiles) = value.get("profiles") {
+        if value.get("state").is_some() {
+            return Err(serde::de::Error::custom(
+                "report has both state and profiles",
+            ));
+        }
+        let reports: BTreeMap<String, Report> = serde_json::from_value(profiles.clone())?;
+        Ok(Reports::Profiles(
+            reports
+                .into_iter()
+                .map(|(name, report)| (name, report_status(report)))
+                .collect(),
+        ))
+    } else {
+        parse_status(bytes).map(Reports::Single)
     }
 }
 
 /// The status in a status command's output.
 fn parse_status(bytes: &[u8]) -> Result<Status, serde_json::Error> {
     let report: Report = serde_json::from_slice(bytes)?;
+    Ok(report_status(report))
+}
+
+fn report_status(report: Report) -> Status {
     let state = match report.state {
         ReportedState::Ready => State::Ready,
         ReportedState::StartsOnLaunch => State::StartsOnLaunch,
         ReportedState::Busy => State::Busy,
+        ReportedState::Unknown => State::Unknown,
         ReportedState::Down => State::Down,
     };
-    Ok(Status {
+    Status {
         state,
         message: report.message.as_deref().and_then(reported_text),
         context_window: report.context_window,
         drafting: report.drafting.as_deref().and_then(reported_text),
-    })
+    }
 }
 
 /// A status command's text as one shortened line, or `None` when it is blank.
@@ -489,7 +540,7 @@ fn compare(reply: &Reply, model: &str) -> Status {
         Reply::Models(models) => Status::new(State::ModelMissing, Some(suggest(models, model))),
         Reply::Unlisted(reason) => Status::new(State::Reachable, Some(reason.clone())),
         Reply::Down(reason) => Status::new(State::Down, Some(reason.clone())),
-        Reply::Reported(status) => status.clone(),
+        Reply::Reported(reports) => reports.for_profile(model),
     }
 }
 
@@ -695,20 +746,38 @@ mod tests {
     }
 
     #[test]
-    fn status_commands_that_fail_or_hang_are_down() {
+    fn grouped_reports_reject_ambiguous_or_malformed_results() {
+        for report in [
+            br#"{"profiles":[],"state":"ready"}"#.as_slice(),
+            br#"{"profiles":{"one":{"state":"typo"}}}"#,
+            br#"{"profiles":null}"#,
+        ] {
+            assert!(parse_reports(report).is_err());
+        }
+        let report = parse_reports(br#"{"profiles":{}}"#).ok().unwrap();
+        assert_eq!(report.for_profile("missing").state, State::Unknown);
+        let report = parse_reports(br#"{"state":"unknown","message":"cannot inspect owner"}"#)
+            .ok()
+            .unwrap();
+        assert_eq!(report.for_profile("any").state, State::Unknown);
+    }
+
+    #[test]
+    fn status_commands_that_fail_or_hang_are_unknown() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let run_within = |name: &str, body: &str, timeout: Duration| {
             let path = dir.path().join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let status = run_status(
+            let report = run_status(
                 &Program {
                     path,
                     args: Vec::new(),
                 },
                 timeout,
             );
+            let status = report.for_profile("test");
             (status.state, status.message.unwrap_or_default())
         };
         // Leave a slow machine time to start the shell, except for the hang.
@@ -720,12 +789,12 @@ mod tests {
         assert_eq!(
             run("codex-fails.status", "exit 3"),
             (
-                State::Down,
+                State::Unknown,
                 "codex-fails.status failed (exit status: 3)".to_owned()
             )
         );
         let (state, message) = run("codex-garbled.status", "echo nonsense");
-        assert_eq!(state, State::Down);
+        assert_eq!(state, State::Unknown);
         assert!(
             message.starts_with("codex-garbled.status printed no valid status: "),
             "{message}"
@@ -733,7 +802,7 @@ mod tests {
         // The parse error quotes the state, escape and all.
         let report = format!(r#"{{"state": "\u001b[2J{}"}}"#, "x".repeat(300));
         let (state, message) = run("codex-odd.status", &format!("printf '%s' '{report}'"));
-        assert_eq!(state, State::Down);
+        assert_eq!(state, State::Unknown);
         assert!(
             message
                 .starts_with("codex-odd.status printed no valid status: unknown variant ` [2Jxxx"),
@@ -746,7 +815,7 @@ mod tests {
                 "head -c 100000 /dev/zero\nexec sleep 5"
             ),
             (
-                State::Down,
+                State::Unknown,
                 "codex-floods.status printed too much".to_owned()
             )
         );
@@ -757,7 +826,7 @@ mod tests {
                 Duration::from_millis(500)
             ),
             (
-                State::Down,
+                State::Unknown,
                 "codex-hangs.status did not finish within 500ms".to_owned()
             )
         );
@@ -774,7 +843,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let status = run_status(
+        let report = run_status(
             &Program {
                 path,
                 args: vec!["--status".to_owned(), "two words".to_owned()],
@@ -782,7 +851,7 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(
-            status,
+            report.for_profile("test"),
             Status::new(State::Busy, Some("--status|two words".to_owned()))
         );
     }

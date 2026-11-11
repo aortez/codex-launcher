@@ -28,7 +28,7 @@ const OVERRIDE_HINTS: &str = "e effort · s save effort · Enter launch · ? hel
 const MIN_MEANING_WIDTH: usize = 20;
 
 /// What each server mark means, in the order the help lists them.
-const MARKS: [(State, &str); 8] = [
+const MARKS: [(State, &str); 9] = [
     (
         State::Ready,
         "The server lists the profile's model, or its status command says ready.",
@@ -50,8 +50,12 @@ const MARKS: [(State, &str); 8] = [
         "The server answered, but not with a model list.",
     ),
     (
+        State::Unknown,
+        "The status helper could not determine availability; see the details.",
+    ),
+    (
         State::Down,
-        "No answer, a 5xx error, refused credentials, or a failed status command.",
+        "No answer, a 5xx error, refused credentials, or a status report saying down.",
     ),
     (
         State::Checking,
@@ -482,7 +486,7 @@ fn provider_line(profile: &Profile) -> Line<'static> {
     line
 }
 
-/// A distinct symbol for each state, so the list reads without color.
+/// Symbols make the list readable without color; details explain uncertainty.
 fn mark(state: Option<State>) -> Span<'static> {
     let Some(state) = state else {
         return Span::raw("  ");
@@ -492,7 +496,7 @@ fn mark(state: Option<State>) -> Span<'static> {
         // Neither circle has an ambiguous width, so no terminal draws one wide.
         State::StartsOnLaunch => "◌ ",
         State::Busy => "◉ ",
-        State::Reachable => "? ",
+        State::Reachable | State::Unknown => "? ",
         State::ModelMissing => "! ",
         State::Down => "✗ ",
         State::Checking => "… ",
@@ -522,7 +526,9 @@ fn state_style(state: State) -> Style {
     match state {
         State::Ready => Style::new().fg(Color::Green),
         State::StartsOnLaunch => Style::new().fg(Color::Cyan),
-        State::Busy | State::Reachable | State::ModelMissing => Style::new().fg(Color::Yellow),
+        State::Busy | State::Reachable | State::Unknown | State::ModelMissing => {
+            Style::new().fg(Color::Yellow)
+        }
         State::Down => Style::new().fg(Color::Red),
         State::Checking | State::Skipped => Style::new().add_modifier(Modifier::DIM),
     }
@@ -764,6 +770,12 @@ mod tests {
         for expected in [
             "│? reachable         The server answered, but ",
             "│                    not with a model list. ",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        app.press(Key::End);
+        let screen = render(&mut app, 80, 40);
+        for expected in [
             "│s                  Save the chosen effort to ",
             "│                   the profile's file. ",
         ] {

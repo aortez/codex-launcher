@@ -1199,7 +1199,7 @@ fn status_commands_report_for_wrappers_without_running_them() {
         [
             ("default", "skipped"),
             ("auto", "ready"),
-            ("broken", "down"),
+            ("broken", "unknown"),
             ("busy", "busy"),
             ("even", "ready"),
             ("idle", "starts_on_launch"),
@@ -1230,7 +1230,7 @@ fn status_commands_report_for_wrappers_without_running_them() {
     );
     let screen = screen_of("up");
     for expected in [
-        "│  ✗ broken".to_owned(),
+        "│  ? broken".to_owned(),
         "│  ◉ busy".to_owned(),
         "│  ◌ idle".to_owned(),
         "│> ✓ up".to_owned(),
@@ -1297,6 +1297,85 @@ fn status_commands_report_for_wrappers_without_running_them() {
         serde_json::json!({"state": "ready", "message": null, "context_window": 32768})
     );
     assert!(!launched.exists(), "a server check ran a wrapper");
+}
+
+#[test]
+fn host_status_is_shared_but_reports_each_profile_and_refreshes() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "model = 'base'\n").unwrap();
+    for name in ["alpha", "beta", "missing", "other"] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            "model = 'm'\n",
+        )
+        .unwrap();
+    }
+    let helper = bin.path().join("status");
+    std::fs::write(&helper, r#"#!/bin/sh
+printf 'check\n' >> "$0.$1.calls"
+if [ "$1" = first ]; then
+  printf '%s' '{"profiles":{"alpha":{"state":"starts_on_launch","context_window":131072,"drafting":"off"},"beta":{"state":"busy","message":"another session"}}}'
+else
+  printf '%s' '{"profiles":{"other":{"state":"down","message":"host unreachable"}}}'
+fi
+"#).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A launch command must not run during checks, even for a ready host.
+    let launch = bin.path().join("launch");
+    std::fs::write(&launch, "#!/bin/sh\nprintf 'launched' > \"$0.calls\"\n").unwrap();
+    std::fs::set_permissions(&launch, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.path().join("codex-launcher.toml"),
+        format!(
+            r#"
+[[wrapper]]
+profiles = ["alpha", "beta", "missing"]
+launch = [{launch:?}, "{{profile}}"]
+status = [{helper:?}, "first"]
+[[wrapper]]
+profiles = ["other"]
+launch = [{launch:?}, "{{profile}}"]
+status = [{helper:?}, "second"]
+"#
+        ),
+    )
+    .unwrap();
+    let launcher = Headless::start_with_path(home.path(), &[], bin.path());
+    assert!(!bin.path().join("status.first.calls").exists());
+    for count in 1..=2 {
+        launcher.ctl_json(&["key", "r"]);
+        launcher.checked_state();
+        for host in ["first", "second"] {
+            let calls =
+                std::fs::read_to_string(bin.path().join(format!("status.{host}.calls"))).unwrap();
+            assert_eq!(
+                calls.lines().count(),
+                count,
+                "one check per host per refresh"
+            );
+        }
+        for (name, expected) in [
+            ("alpha", "starts_on_launch"),
+            ("beta", "busy"),
+            ("missing", "unknown"),
+            ("other", "down"),
+        ] {
+            let state = launcher.ctl_json(&["select", name]);
+            assert_eq!(state["profile"]["server"]["state"], expected);
+        }
+        let state = launcher.ctl_json(&["select", "missing"]);
+        assert_eq!(
+            state["profile"]["server"]["message"],
+            "status report omitted missing"
+        );
+        let state = launcher.ctl_json(&["select", "alpha"]);
+        assert_eq!(state["profile"]["server"]["context_window"], 131072);
+        assert_eq!(state["profile"]["server"]["drafting"], "off");
+    }
+    assert!(!bin.path().join("launch.calls").exists());
+    launcher.ctl_json(&["quit"]);
 }
 
 #[test]
