@@ -3,27 +3,38 @@
 //! One `GET <base_url>/models` covers every profile that shares a server and
 //! headers. Ollama, vLLM, llama.cpp, and most gateways serve this
 //! OpenAI-compatible list, and reading it does not load a model.
+//!
+//! A profile with a `codex-<name>.status` command on `PATH` runs that command
+//! instead, and it reports the server's state itself. The check never runs a
+//! profile's wrapper, which may start a server.
 
 use std::io::{ErrorKind, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
 use reqwest::{StatusCode, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::launch::Command;
+use crate::launch::{self, Command};
+use crate::process::{self, Outcome};
 use crate::profile::{Catalog, Profile};
 use crate::provider;
 
 /// How long a server has to answer, including the response body.
 pub const TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a status command has to finish. It may need to reach a host over
+/// SSH first.
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIST_BYTES: u64 = 4 << 20;
+const MAX_STATUS_BYTES: u64 = 64 << 10;
 /// The most model names that a "model missing" message suggests.
 const MAX_SUGGESTIONS: usize = 3;
+/// The most characters of a status command's text that the menu keeps.
+const MAX_REPORTED_CHARS: usize = 200;
 
 /// What the launcher knows about a profile's server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -31,8 +42,13 @@ const MAX_SUGGESTIONS: usize = 3;
 pub enum State {
     /// The request has not finished.
     Checking,
-    /// The server lists the profile's model.
+    /// The server lists the profile's model, or its status command says the
+    /// server is ready.
     Ready,
+    /// The status command says that launching starts the server.
+    StartsOnLaunch,
+    /// The status command says that the server is busy with other work.
+    Busy,
     /// The server answered without a model list to compare.
     Reachable,
     /// The server lists other models, but not this one.
@@ -49,6 +65,8 @@ impl State {
         match self {
             Self::Checking => "checking",
             Self::Ready => "ready",
+            Self::StartsOnLaunch => "starts on launch",
+            Self::Busy => "busy",
             Self::Reachable => "reachable",
             Self::ModelMissing => "model missing",
             Self::Down => "down",
@@ -62,27 +80,68 @@ impl State {
 pub struct Status {
     pub state: State,
     pub message: Option<String>,
+    /// The context window the server allocates, when a status command says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// The server's draft-model setting, when a status command says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drafting: Option<String>,
 }
 
 impl Status {
     fn new(state: State, message: Option<String>) -> Self {
-        Self { state, message }
+        Self {
+            state,
+            message,
+            context_window: None,
+            drafting: None,
+        }
     }
 }
 
-/// What one server returned.
+/// What one server or status command returned.
 enum Reply {
     Models(Vec<String>),
     /// An answer without a readable model list, and why.
     Unlisted(String),
     /// No usable answer, and why.
     Down(String),
+    /// A status command's report, which needs no comparison.
+    Reported(Status),
+}
+
+/// One request, which answers for every profile that waits on it.
+enum Probe {
+    /// Ask a server for its model list, with these headers.
+    Models(&'static Client, Url, HeaderMap),
+    /// Run a profile's status command.
+    Status(PathBuf),
+}
+
+impl Probe {
+    /// Whether one request can answer for both.
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Models(_, url, headers), Self::Models(_, other_url, other_headers)) => {
+                url == other_url && headers == other_headers
+            }
+            (Self::Status(path), Self::Status(other_path)) => path == other_path,
+            _ => false,
+        }
+    }
+
+    fn run(self) -> Reply {
+        match self {
+            Self::Models(client, url, headers) => fetch(client, url, headers),
+            Self::Status(path) => Reply::Reported(run_status(&path, STATUS_TIMEOUT)),
+        }
+    }
 }
 
 /// The latest server check for each profile in a menu or listing.
 pub struct Checks {
     statuses: Vec<Option<Status>>,
-    /// The server that each checked profile waits on, and the model to find.
+    /// The request that each checked profile waits on, and the model to find.
     targets: Vec<Option<(usize, String)>>,
     /// Replies to the current round. Replacing it discards older rounds.
     replies: Option<Receiver<(usize, Reply)>>,
@@ -116,32 +175,34 @@ impl Checks {
     }
 
     /// Check every profile again in the background, with one request for each
-    /// distinct server and set of headers. `commands` are the profiles' launch
-    /// commands, and `args` the launch arguments that may change the model.
+    /// distinct server and set of headers, or one run of a profile's status
+    /// command. `commands` are the profiles' launch commands, and `args` the
+    /// launch arguments that may change the model.
     pub fn start(&mut self, catalog: &Catalog, commands: &[Command], args: &[String]) {
         let (sender, receiver) = mpsc::channel();
         self.replies = Some(receiver);
         let client = provider::client().map_err(|error| format!("{error:#}"));
-        let mut servers: Vec<(Url, HeaderMap)> = Vec::new();
+        let mut probes: Vec<Probe> = Vec::new();
         (self.targets, self.statuses) = catalog
             .profiles
             .iter()
             .zip(commands)
             .map(|(profile, command)| {
-                let planned = match &client {
-                    Ok(_) => request(profile, command, &catalog.codex_home, args),
-                    Err(reason) => Err(reason.clone()),
+                let planned = match (&command.status, &client) {
+                    // A status command's report needs no model to compare.
+                    (Some(path), _) => Ok((Probe::Status(path.clone()), String::new())),
+                    (None, Ok(client)) => request(profile, command, &catalog.codex_home, args)
+                        .map(|(url, headers, model)| (Probe::Models(client, url, headers), model)),
+                    (None, Err(reason)) => Err(reason.clone()),
                 };
                 match planned {
-                    Ok((url, headers, model)) => {
-                        let server = servers
+                    Ok((probe, model)) => {
+                        let server = probes
                             .iter()
-                            .position(|(known_url, known_headers)| {
-                                *known_url == url && *known_headers == headers
-                            })
+                            .position(|known| known.same(&probe))
                             .unwrap_or_else(|| {
-                                servers.push((url, headers));
-                                servers.len() - 1
+                                probes.push(probe);
+                                probes.len() - 1
                             });
                         (
                             Some((server, model)),
@@ -152,16 +213,13 @@ impl Checks {
                 }
             })
             .unzip();
-        let Ok(client) = client else {
-            return;
-        };
-        for (server, (url, headers)) in servers.into_iter().enumerate() {
+        for (server, probe) in probes.into_iter().enumerate() {
             let sender = sender.clone();
             let spawned = std::thread::Builder::new()
                 .name("server-check".to_owned())
                 .spawn(move || {
                     // Sending fails once a newer round or an exit drops the receiver.
-                    let _ = sender.send((server, fetch(client, url, headers)));
+                    let _ = sender.send((server, probe.run()));
                 });
             if let Err(error) = spawned {
                 let reason = format!("cannot start the check: {error}");
@@ -192,7 +250,7 @@ impl Checks {
     /// Wait for the servers that have yet to answer.
     pub fn wait(&mut self) {
         // Each request has its own timeout; this only guards against a hang.
-        let deadline = Instant::now() + TIMEOUT + Duration::from_secs(1);
+        let deadline = Instant::now() + TIMEOUT.max(STATUS_TIMEOUT) + Duration::from_secs(1);
         while self.is_running() {
             let Some(replies) = &self.replies else {
                 return;
@@ -224,7 +282,11 @@ fn request(
 ) -> Result<(Url, HeaderMap, String), String> {
     // A wrapper may start the server or load credentials before Codex runs.
     if command.wrapper.is_some() {
-        return Err(format!("launched through {}", command.program));
+        return Err(format!(
+            "launched through {}, which has no {}",
+            command.program,
+            launch::status_name(&profile.name)
+        ));
     }
     let (config, model) = provider::effective_config(profile, codex_home, args)
         .map_err(|error| format!("{error:#}"))?;
@@ -232,6 +294,79 @@ fn request(
     let connection = provider::connection(&config, |key| std::env::var(key).ok())?;
     let url = connection.url(&format!("{}/models", connection.base_path()));
     Ok((url, connection.headers, model))
+}
+
+/// What a status command prints: one JSON object.
+#[derive(Deserialize)]
+struct Report {
+    state: ReportedState,
+    message: Option<String>,
+    context_window: Option<u64>,
+    drafting: Option<String>,
+}
+
+/// The states a status command may report.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportedState {
+    Ready,
+    StartsOnLaunch,
+    Busy,
+    Down,
+}
+
+/// Run a profile's status command and read its report.
+fn run_status(path: &Path, timeout: Duration) -> Status {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let down = |reason: String| Status::new(State::Down, Some(reason));
+    let mut command = std::process::Command::new(path);
+    match process::run(&mut command, Instant::now() + timeout, MAX_STATUS_BYTES) {
+        Ok(Outcome::Exited(exit, bytes)) if exit.success() => parse_status(&bytes)
+            .unwrap_or_else(|error| down(format!("{name} printed no valid status: {error}"))),
+        Ok(Outcome::Exited(exit, _)) => down(format!("{name} failed ({exit})")),
+        Ok(Outcome::TooLarge) => down(format!("{name} printed too much")),
+        Ok(Outcome::TimedOut) => down(format!("{name} did not finish within {timeout:?}")),
+        Err(error) => down(format!("cannot run {name}: {error}")),
+    }
+}
+
+/// The status in a status command's output.
+fn parse_status(bytes: &[u8]) -> Result<Status, serde_json::Error> {
+    let report: Report = serde_json::from_slice(bytes)?;
+    let state = match report.state {
+        ReportedState::Ready => State::Ready,
+        ReportedState::StartsOnLaunch => State::StartsOnLaunch,
+        ReportedState::Busy => State::Busy,
+        ReportedState::Down => State::Down,
+    };
+    Ok(Status {
+        state,
+        message: report.message.as_deref().and_then(reported_text),
+        context_window: report.context_window,
+        drafting: report.drafting.as_deref().and_then(reported_text),
+    })
+}
+
+/// A status command's text as one shortened line, or `None` when it is blank.
+/// Control characters become spaces, so the text cannot move the cursor.
+fn reported_text(text: &str) -> Option<String> {
+    let line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= MAX_REPORTED_CHARS {
+        return Some(line.to_owned());
+    }
+    let mut short: String = line.chars().take(MAX_REPORTED_CHARS - 1).collect();
+    short.push('…');
+    Some(short)
 }
 
 /// Ask one server for its model list.
@@ -329,6 +464,7 @@ fn compare(reply: &Reply, model: &str) -> Status {
         Reply::Models(models) => Status::new(State::ModelMissing, Some(suggest(models, model))),
         Reply::Unlisted(reason) => Status::new(State::Reachable, Some(reason.clone())),
         Reply::Down(reason) => Status::new(State::Down, Some(reason.clone())),
+        Reply::Reported(status) => status.clone(),
     }
 }
 
@@ -464,5 +600,68 @@ mod tests {
             panic!("an unresolvable host must be down");
         };
         assert_eq!(reason, "could not resolve the host");
+    }
+
+    #[test]
+    fn status_reports_keep_known_fields_as_short_single_lines() {
+        let status = parse_status(
+            br#"{"state": "busy", "message": " another\nsession\u001b[2J ",
+                "context_window": 32768, "drafting": "on", "future_field": true}"#,
+        )
+        .unwrap();
+        assert_eq!(status.state, State::Busy);
+        assert_eq!(status.message.as_deref(), Some("another session [2J"));
+        assert_eq!(status.context_window, Some(32768));
+        assert_eq!(status.drafting.as_deref(), Some("on"));
+
+        let status = parse_status(br#"{"state": "starts_on_launch", "message": "  "}"#).unwrap();
+        assert_eq!(status, Status::new(State::StartsOnLaunch, None));
+
+        let long = format!(r#"{{"state": "down", "message": "{}"}}"#, "x".repeat(300));
+        let message = parse_status(long.as_bytes()).unwrap().message.unwrap();
+        assert_eq!(message.chars().count(), MAX_REPORTED_CHARS);
+        assert!(message.ends_with('…'), "{message}");
+
+        let error = parse_status(br#"{"state": "idle"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown variant `idle`"), "{error}");
+    }
+
+    #[test]
+    fn status_commands_that_fail_or_hang_are_down() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let status = run_status(&path, Duration::from_millis(500));
+            (status.state, status.message.unwrap_or_default())
+        };
+        assert_eq!(
+            run("codex-up.status", r#"printf '{"state": "ready"}'"#),
+            (State::Ready, String::new())
+        );
+        assert_eq!(
+            run("codex-fails.status", "exit 3"),
+            (
+                State::Down,
+                "codex-fails.status failed (exit status: 3)".to_owned()
+            )
+        );
+        let (state, message) = run("codex-garbled.status", "echo nonsense");
+        assert_eq!(state, State::Down);
+        assert!(
+            message.starts_with("codex-garbled.status printed no valid status: "),
+            "{message}"
+        );
+        assert_eq!(
+            run("codex-hangs.status", "exec sleep 5"),
+            (
+                State::Down,
+                "codex-hangs.status did not finish within 500ms".to_owned()
+            )
+        );
     }
 }

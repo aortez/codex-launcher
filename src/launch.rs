@@ -21,6 +21,9 @@ pub struct Command {
     pub args: Vec<String>,
     /// The resolved `codex-<profile>` wrapper, when one is on `PATH`.
     pub wrapper: Option<PathBuf>,
+    /// The resolved `codex-<profile>.status` command, when one is on `PATH`.
+    /// Server checks run it instead of asking the server themselves.
+    pub status: Option<PathBuf>,
 }
 
 impl Command {
@@ -56,10 +59,13 @@ impl Command {
     /// when that executable is on `path`. The wrapper is expected to select the
     /// profile itself.
     pub fn for_profile(profile: &Profile, extra: &[String], path: Option<&OsStr>) -> Self {
-        let wrapper = if profile.is_default() {
-            None
+        let (wrapper, status) = if profile.is_default() {
+            (None, None)
         } else {
-            find_wrapper(&profile.name, path)
+            (
+                find_wrapper(&profile.name, path),
+                find_executable(&status_name(&profile.name), path),
+            )
         };
         let mut args = Vec::new();
         let program = if wrapper.is_some() {
@@ -75,6 +81,7 @@ impl Command {
             program,
             args,
             wrapper,
+            status,
         }
     }
 
@@ -112,6 +119,12 @@ impl Command {
 /// The wrapper executable name for a profile.
 pub fn wrapper_name(profile: &str) -> String {
     format!("{CODEX}-{profile}")
+}
+
+/// The status command's executable name for a profile. Profile names cannot
+/// contain a dot, so it never names another profile's wrapper.
+pub fn status_name(profile: &str) -> String {
+    format!("{}.status", wrapper_name(profile))
 }
 
 /// Codex arguments that select a profile.
@@ -222,6 +235,23 @@ mod tests {
 
         let launcher = Command::for_profile(catalog.find("launcher").unwrap(), &[], Some(&path));
         assert_eq!(launcher.argv(), ["codex", "--profile", "launcher"]);
+    }
+
+    #[test]
+    fn status_command_comes_from_path_for_named_profiles() {
+        let (_home, catalog) = catalog(&["work"]);
+        let bin = tempfile::tempdir().unwrap();
+        executable(bin.path(), "codex-work.status");
+        executable(bin.path(), "codex-default.status");
+        let path = Some(bin.path().as_os_str());
+
+        let work = Command::for_profile(catalog.find("work").unwrap(), &[], path);
+        assert_eq!(work.status, Some(bin.path().join("codex-work.status")));
+        // A status command does not change what launching runs.
+        assert_eq!(work.argv(), ["codex", "--profile", "work"]);
+
+        let default = Command::for_profile(catalog.find("default").unwrap(), &[], path);
+        assert_eq!(default.status, None);
     }
 
     #[test]

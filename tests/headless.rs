@@ -1099,7 +1099,7 @@ fn server_checks_mark_profiles_and_recheck_on_demand() {
     let state = launcher.ctl_json(&["select", "wrapped"]);
     assert_eq!(
         state["profile"]["server"]["message"],
-        "launched through codex-wrapped"
+        "launched through codex-wrapped, which has no codex-wrapped.status"
     );
     launcher.ctl_json(&["select", "offline"]);
     let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
@@ -1132,6 +1132,105 @@ fn server_checks_mark_profiles_and_recheck_on_demand() {
     let state = launcher.checked_state();
     assert_eq!(state["menu"][2]["server"], "ready");
     assert_eq!(server.requests.try_iter().count(), 1);
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn status_commands_report_for_wrappers_without_running_them() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "model = 'base'\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let launched = bin.path().join("launched");
+    let executable = |name: String, text: String| {
+        let path = bin.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    for (name, report) in [
+        ("broken", "not json"),
+        (
+            "busy",
+            r#"{"state": "busy", "message": "another session holds the server"}"#,
+        ),
+        ("idle", r#"{"state": "starts_on_launch", "drafting": "on"}"#),
+        ("up", r#"{"state": "ready", "context_window": 32768}"#),
+    ] {
+        std::fs::write(
+            home.path().join(format!("{name}.config.toml")),
+            "model = 'm'\nmodel_context_window = 65536\n",
+        )
+        .unwrap();
+        // The wrapper would start the server, so a check must never run it.
+        // The PATH holds nothing else, so it uses only shell built-ins.
+        executable(
+            format!("codex-{name}"),
+            format!("#!/bin/sh\n: > {launched:?}\n"),
+        );
+        executable(
+            format!("codex-{name}.status"),
+            format!("#!/bin/sh\nprintf '%s' '{report}'\n"),
+        );
+    }
+
+    let launcher = Headless::launch(home.path(), &[], bin.path(), &[]);
+    let state = launcher.checked_state();
+    let servers: Vec<_> = state["menu"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap(),
+                entry["server"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        servers,
+        [
+            ("default", "skipped"),
+            ("broken", "down"),
+            ("busy", "busy"),
+            ("idle", "starts_on_launch"),
+            ("up", "ready"),
+        ]
+    );
+    let state = launcher.ctl_json(&["select", "broken"]);
+    let message = state["profile"]["server"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("codex-broken.status printed no valid status: "),
+        "{message}"
+    );
+    let state = launcher.ctl_json(&["select", "busy"]);
+    assert_eq!(
+        state["profile"]["server"],
+        serde_json::json!({"state": "busy", "message": "another session holds the server"})
+    );
+    let state = launcher.ctl_json(&["select", "up"]);
+    assert_eq!(state["profile"]["server"]["context_window"], 32768);
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    for expected in [
+        "│  ✗ broken",
+        "│  ● busy",
+        "│  ○ idle",
+        "│> ✓ up",
+        "server    ready",
+        "context   65536  server allocates 32768",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+    launcher.ctl_json(&["select", "idle"]);
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    for expected in [
+        "server    starts on launch",
+        "context   65536",
+        "drafting  on",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+    assert!(!screen.contains("server allocates"), "{screen}");
+    assert!(!launched.exists(), "a server check ran a wrapper");
     launcher.ctl_json(&["quit"]);
 }
 
