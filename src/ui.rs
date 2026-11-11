@@ -357,12 +357,14 @@ pub fn details(app: &App) -> Text<'static> {
         lines.push(server_line(status));
     }
     lines.push(setting_line(profile, "effort", app.effective_effort()));
-    if profile.context_window.is_some() {
-        lines.push(setting_line(
-            profile,
-            "context",
-            profile.context_window.as_ref(),
-        ));
+    // Most profiles leave these to Codex, so they show only when a layer sets them.
+    for (label, setting) in [
+        ("context", &profile.context_window),
+        ("compact", &profile.auto_compact_token_limit),
+    ] {
+        if setting.is_some() {
+            lines.push(setting_line(profile, label, setting.as_ref()));
+        }
     }
     lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
     lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
@@ -558,6 +560,39 @@ mod tests {
         assert!(screen.contains("provider  openai  (built-in)"), "{screen}");
         assert!(screen.contains("launch    codex"), "{screen}");
         assert!(!screen.contains("(base)"), "{screen}");
+    }
+
+    #[test]
+    fn context_and_compaction_show_beside_effort_when_set() {
+        let (_home, mut app) = fixture_app();
+        app.select_name("local").unwrap();
+        let screen = render(&mut app, 100, 30);
+        let rows: Vec<&str> = screen.lines().collect();
+        let effort = rows
+            .iter()
+            .position(|row| row.contains("effort    medium"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(rows[effort + 1].contains("context   65536"), "{screen}");
+        assert!(rows[effort + 2].contains("compact   57344"), "{screen}");
+
+        // A profile that leaves both to Codex shows neither row.
+        app.select_name("gateway").unwrap();
+        let screen = render(&mut app, 100, 30);
+        assert!(!screen.contains("context "), "{screen}");
+        assert!(!screen.contains("compact "), "{screen}");
+
+        // Each row depends only on its own key.
+        let home = fixture_home();
+        std::fs::write(
+            home.path().join("compact-only.config.toml"),
+            "model_auto_compact_token_limit = 1000\n",
+        )
+        .unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        app.select_name("compact-only").unwrap();
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("compact   1000"), "{screen}");
+        assert!(!screen.contains("context "), "{screen}");
     }
 
     #[test]
