@@ -15,7 +15,7 @@ pub const CODEX: &str = "codex";
 const SELF_NAME: &str = "launcher";
 
 /// A program to run, with its arguments.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     pub path: PathBuf,
     pub args: Vec<String>,
@@ -32,15 +32,17 @@ impl Program {
 }
 
 /// The command that launching a profile runs.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     /// The program name shown to the user.
     pub program: String,
     pub args: Vec<String>,
     /// How many of `args` belong to the wrapper itself. The Codex arguments,
     /// such as an effort override, follow them.
-    #[serde(skip)]
     pub wrapper_arg_count: usize,
+    /// Whether codex-launcher.toml gave this profile its commands, so that
+    /// `PATH` was not searched.
+    pub configured: bool,
     /// The wrapper that launching runs: the resolved `codex-<profile>` on
     /// `PATH`, or the launch command that codex-launcher.toml gives.
     pub wrapper: Option<PathBuf>,
@@ -105,6 +107,7 @@ impl Command {
                 profile_args(&profile.name)
             },
             wrapper_arg_count: 0,
+            configured: false,
             wrapper: None,
             status: None,
         }
@@ -118,10 +121,12 @@ impl Command {
                 program: launch.path.to_string_lossy().into_owned(),
                 args: launch.args.clone(),
                 wrapper_arg_count: launch.args.len(),
+                configured: true,
                 wrapper: Some(launch.path.clone()),
                 status,
             },
             None => Self {
+                configured: true,
                 status,
                 ..Self::plain(profile)
             },
@@ -142,6 +147,7 @@ impl Command {
                 program: wrapper_name(&profile.name),
                 args: Vec::new(),
                 wrapper_arg_count: 0,
+                configured: false,
                 wrapper: Some(wrapper),
                 status,
             },

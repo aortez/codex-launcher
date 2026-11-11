@@ -292,7 +292,7 @@ fn request(
 ) -> Result<(Url, HeaderMap, String), String> {
     // A wrapper may start the server or load credentials before Codex runs.
     if let Some(wrapper) = &command.wrapper {
-        return Err(if profile.wrapper.is_some() {
+        return Err(if command.configured {
             format!(
                 "launched through {}, and {} gives it no status command",
                 file_name(wrapper),

@@ -403,7 +403,7 @@ pub fn details(app: &App) -> Text<'static> {
     lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
     match &command.wrapper {
         // The launch command already names a wrapper from codex-launcher.toml.
-        Some(wrapper) if profile.wrapper.is_some() => {
+        Some(wrapper) if command.configured => {
             lines.push(row(
                 "launch",
                 command_line(wrapper, &command.args, app.home()),
@@ -538,20 +538,24 @@ fn row(label: &str, value: String, tag: &str) -> Line<'static> {
 }
 
 /// Show `path` relative to `home` as `~/...` when it is inside it.
-/// A program and its shell-quoted arguments, with the program shortened like
-/// [`display_path`].
-fn command_line(program: &Path, args: &[String], home: Option<&Path>) -> String {
-    std::iter::once(display_path(program, home))
-        .chain(args.iter().map(|arg| shell_quote(arg)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
+}
+
+/// A command as a shell-quoted line, with a program in the home directory
+/// shown as `~/...`, which a shell still expands.
+fn command_line(program: &Path, args: &[String], home: Option<&Path>) -> String {
+    let program = match home.and_then(|home| program.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", shell_quote(&rest.to_string_lossy())),
+        None => shell_quote(&program.to_string_lossy()),
+    };
+    std::iter::once(program)
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Render a buffer as text, one line per row, without trailing spaces.
@@ -787,6 +791,24 @@ mod tests {
             "~/bin/x"
         );
         assert_eq!(display_path(Path::new("/opt/x"), Some(home)), "/opt/x");
+    }
+
+    #[test]
+    fn command_lines_quote_the_program_too() {
+        let home = Path::new("/home/u");
+        let args = ["work".to_owned(), "two words".to_owned()];
+        assert_eq!(
+            command_line(Path::new("/home/u/bin/run"), &args, Some(home)),
+            "~/bin/run work 'two words'"
+        );
+        assert_eq!(
+            command_line(Path::new("/home/u/my tools/run"), &args, Some(home)),
+            "~/'my tools/run' work 'two words'"
+        );
+        assert_eq!(
+            command_line(Path::new("/opt/it's/check"), &[], Some(home)),
+            r"'/opt/it'\''s/check'"
+        );
     }
 
     #[test]

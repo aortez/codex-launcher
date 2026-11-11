@@ -1317,7 +1317,7 @@ fn codex_launcher_toml_names_launch_and_status_commands() {
         std::fs::write(&path, text).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     };
-    // One script serves both profiles, and reports instead with --status. The
+    // One script serves every profile, and reports instead with --status. The
     // PATH holds nothing else, so it uses only shell built-ins.
     std::fs::create_dir(home.path().join("bin")).unwrap();
     let run = home.path().join("bin/run");
@@ -1327,23 +1327,31 @@ fn codex_launcher_toml_names_launch_and_status_commands() {
             "#!/bin/sh\nif [ \"$1\" = --status ]; then\n  printf '{{\"state\": \"busy\", \"message\": \"%s is busy\"}}' \"$2\"\nelse\n  : > {launched:?}\nfi\n"
         ),
     );
-    // The file takes precedence over these.
+    // The file takes precedence over these, even where its commands are broken.
     let bin = tempfile::tempdir().unwrap();
-    executable(
-        bin.path().join("codex-alpha"),
-        format!("#!/bin/sh\n: > {launched:?}\n"),
-    );
+    for name in ["codex-alpha", "codex-beta"] {
+        executable(
+            bin.path().join(name),
+            format!("#!/bin/sh\n: > {launched:?}\n"),
+        );
+    }
     executable(
         bin.path().join("codex-alpha.status"),
         "#!/bin/sh\nprintf '{\"state\": \"ready\"}'\n".to_owned(),
     );
+    let config = codex_home.join("codex-launcher.toml");
     std::fs::write(
-        codex_home.join("codex-launcher.toml"),
+        &config,
         r#"
 [[wrapper]]
-profiles = ["alpha", "beta", "missing"]
+profiles = ["alpha", "missing"]
 launch = ["~/bin/run", "{profile}"]
 status = ["~/bin/run", "--status", "{profile}"]
+
+[[wrapper]]
+profiles = ["beta"]
+launch = ["~/bin/run", "{profile}"]
+status = ["bin/run", "--status", "{profile}"]
 
 [[wrapper]]
 profiles = ["plain"]
@@ -1351,24 +1359,25 @@ launch = ["~/bin/absent"]
 "#,
     )
     .unwrap();
-    let launcher = |args: &[&str]| {
+    let launcher_with_home = |args: &[&str], home_var: &Path| {
         Command::new(BIN)
             .args(args)
+            .current_dir(home.path())
             .env("CODEX_HOME", &codex_home)
-            .env("HOME", home.path())
+            .env("HOME", home_var)
             .env("PATH", bin.path())
             .output()
             .unwrap()
     };
+    let launcher = |args: &[&str]| launcher_with_home(args, home.path());
+    let warnings = "codex-launcher: warning: codex-launcher.toml: wrapper 1: no profile is named \"missing\"\n\
+        codex-launcher: warning: codex-launcher.toml: wrapper 2: status must start with an absolute path or ~/, not \"bin/run\"\n";
 
     let output = launcher(&["list", "--check", "--json"]);
     assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "codex-launcher: warning: codex-launcher.toml: wrapper 1: no profile is named \"missing\"\n"
-    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
     let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let entry = |profile: &str| {
+    let entry_in = |listed: &Value, profile: &str| {
         listed
             .as_array()
             .unwrap()
@@ -1377,6 +1386,7 @@ launch = ["~/bin/absent"]
             .unwrap()
             .clone()
     };
+    let entry = |profile: &str| entry_in(&listed, profile);
     let run_path = run.to_str().unwrap();
     let alpha = entry("alpha");
     assert_eq!(
@@ -1389,21 +1399,50 @@ launch = ["~/bin/absent"]
         alpha["status_command"],
         format!("{run_path} --status alpha")
     );
-    assert_eq!(entry("beta")["server"]["message"], "beta is busy");
+    // Its broken status command is left out, but codex-beta still is not used.
+    let beta = entry("beta");
+    assert_eq!(beta["command"], serde_json::json!([run_path, "beta"]));
     assert_eq!(
-        entry("plain")["server"],
-        serde_json::json!({"state": "skipped", "message": "launched through absent, and codex-launcher.toml gives it no status command"})
+        beta["server"],
+        serde_json::json!({"state": "skipped", "message": "launched through run, and codex-launcher.toml gives it no status command"})
     );
 
+    // Launching directly or showing a profile prints the warnings too.
+    let output = launcher(&["beta", "--dry-run"]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{run_path} beta\n")
+    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
+    let output = launcher(&["show", "beta"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
     let output = launcher(&["plain"]);
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         format!(
-            "codex-launcher: cannot run {}: No such file or directory (os error 2)\n",
+            "{warnings}codex-launcher: cannot run {}: No such file or directory (os error 2)\n",
             home.path().join("bin/absent").display()
         )
     );
+
+    // A relative HOME would make ~/ depend on the current directory, which
+    // here holds bin/run.
+    let output = launcher_with_home(&["list", "--check", "--json"], Path::new("."));
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for key in ["launch", "status"] {
+        let warning = format!("wrapper 1: {key} starts with ~/, but HOME is unset or not absolute");
+        assert!(stderr.contains(&warning), "{warning:?} missing:\n{stderr}");
+    }
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alpha = entry_in(&listed, "alpha");
+    assert_eq!(
+        alpha["command"],
+        serde_json::json!(["codex", "--profile", "alpha"])
+    );
+    assert_eq!(alpha["status_command"], Value::Null);
 
     // An effort override goes after the wrapper's own arguments.
     let menu = Headless::launch(
@@ -1425,18 +1464,35 @@ launch = ["~/bin/absent"]
             "hi"
         ])
     );
-    let screen = String::from_utf8(menu.ctl(&["screen"]).stdout).unwrap();
-    for expected in [
+    let screen_has = |expected: &[&str]| {
+        let screen = String::from_utf8(menu.ctl(&["screen"]).stdout).unwrap();
+        for expected in expected {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        assert!(!screen.contains("wrapper "), "{screen}");
+    };
+    screen_has(&[
         "launch    ~/bin/run alpha -c 'model_reasoning_effort=\"high\"' exec hi",
         "status    ~/bin/run --status alpha",
-    ] {
-        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
-    }
-    assert!(!screen.contains("wrapper "), "{screen}");
-    menu.ctl_json(&["launch"]);
+    ]);
+    // Saving reloads the profiles, but what runs and what shows still come
+    // from the file as it was when the menu opened.
+    std::fs::remove_file(&config).unwrap();
+    let state = menu.ctl_json(&["save-effort"]);
     assert_eq!(
-        menu.finish(),
-        format!("{run_path} alpha -c 'model_reasoning_effort=\"high\"' exec hi\n")
+        state["profile"]["command"],
+        serde_json::json!([run_path, "alpha", "exec", "hi"])
+    );
+    screen_has(&[
+        "launch    ~/bin/run alpha exec hi",
+        "status    ~/bin/run --status alpha",
+    ]);
+    menu.ctl_json(&["launch"]);
+    assert_eq!(menu.finish(), format!("{run_path} alpha exec hi\n"));
+    let saved = std::fs::read_to_string(codex_home.join("alpha.config.toml")).unwrap();
+    assert!(
+        saved.contains("model_reasoning_effort = \"high\""),
+        "{saved}"
     );
     assert!(!launched.exists(), "a server check ran a wrapper");
 }

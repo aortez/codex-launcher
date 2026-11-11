@@ -113,7 +113,9 @@ pub struct Profile {
     pub raw: Option<String>,
     /// A read or parse problem that makes the settings incomplete.
     pub error: Option<String>,
-    /// The commands that codex-launcher.toml gives this profile.
+    /// The commands that codex-launcher.toml gives this profile. A profile's
+    /// launch [`Command`](crate::launch::Command) is built from this once, so
+    /// read that command for what runs.
     pub wrapper: Option<Wrapper>,
 }
 
@@ -148,6 +150,14 @@ impl Catalog {
             .iter()
             .position(|profile| profile.name == name)
     }
+}
+
+/// The home directory, when `HOME` names an absolute path. A relative one
+/// would make `~/` paths depend on the current directory.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
 }
 
 /// Resolve the Codex home directory the same way Codex does.
@@ -206,10 +216,7 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         names.push(name.to_owned());
     }
     names.sort();
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from);
-    let mut wrappers = wrappers::load(codex_home, &names, home.as_deref(), &mut warnings);
+    let mut wrappers = wrappers::load(codex_home, &names, home_dir().as_deref(), &mut warnings);
 
     let mut profiles = Vec::with_capacity(names.len() + 1);
     profiles.push(build_profile(

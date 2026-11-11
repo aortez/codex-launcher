@@ -11,7 +11,7 @@
 //!
 //! Each command is the program, then its arguments. `{profile}` becomes the
 //! profile's name, and a program that starts with `~/` is in the home
-//! directory. A problem skips only the entry or name that has it.
+//! directory. A problem leaves out only the command or name that has it.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -77,7 +77,8 @@ fn parse(
     let Some(item) = document.get("wrapper") else {
         return wrappers;
     };
-    let Some(entries) = item.as_array_of_tables() else {
+    // [[wrapper]] tables, or the same entries as `wrapper = [{ ... }]`.
+    let Ok(entries) = item.clone().into_array_of_tables() else {
         warnings.push(format!(
             "{FILE_NAME}: write each wrapper as a [[wrapper]] table"
         ));
@@ -99,20 +100,19 @@ fn parse(
                 continue;
             }
         };
-        let (launch, status) = match (
-            template(entry, "launch", home),
-            template(entry, "status", home),
-        ) {
-            (Err(problem), _) | (_, Err(problem)) => {
+        // A command with a problem is left out, but the entry still names
+        // its profiles, so a wrapper on PATH cannot take over.
+        let mut command = |key: &str| {
+            template(entry, key, home).unwrap_or_else(|problem| {
                 warn(problem);
-                continue;
-            }
-            (Ok(None), Ok(None)) => {
-                warn("needs a launch command, a status command, or both".to_owned());
-                continue;
-            }
-            (Ok(launch), Ok(status)) => (launch, status),
+                None
+            })
         };
+        let launch = command("launch");
+        let status = command("status");
+        if !entry.contains_key("launch") && !entry.contains_key("status") {
+            warn("needs a launch command, a status command, or both".to_owned());
+        }
         for name in names {
             if name == DEFAULT_PROFILE {
                 warn(format!(
@@ -121,7 +121,7 @@ fn parse(
             } else if !profiles.iter().any(|profile| profile == name) {
                 warn(format!("no profile is named {name:?}"));
             } else if wrappers.contains_key(name) {
-                warn(format!("an earlier wrapper already covers {name:?}"));
+                warn(format!("{name:?} is already named above"));
             } else {
                 let wrapper = Wrapper {
                     launch: launch.as_ref().map(|command| command.fill(name)),
@@ -169,9 +169,14 @@ fn template<'a>(
     };
     // A relative program would depend on the directory the launcher runs in.
     let (home, program) = match program.strip_prefix("~/") {
+        Some("") => return Err(format!("{key} names no program after ~/")),
         Some(rest) => match home {
             Some(home) => (Some(home), rest),
-            None => return Err(format!("{key} starts with ~/, but HOME is not set")),
+            None => {
+                return Err(format!(
+                    "{key} starts with ~/, but HOME is unset or not absolute"
+                ));
+            }
         },
         None if program.starts_with('/') => (None, program),
         None => {
@@ -209,7 +214,7 @@ mod tests {
     use super::*;
 
     fn parsed(text: &str, home: Option<&Path>) -> (BTreeMap<String, Wrapper>, Vec<String>) {
-        let profiles = ["alpha", "beta", "gamma"].map(str::to_owned);
+        let profiles = ["alpha", "beta", "delta", "gamma", "omega"].map(str::to_owned);
         let mut warnings = Vec::new();
         let wrappers = parse(&text.parse().unwrap(), &profiles, home, &mut warnings);
         (wrappers, warnings)
@@ -259,13 +264,13 @@ status = ["~/bin/check-{profile}"]
     }
 
     #[test]
-    fn problems_skip_only_the_entry_or_name_that_has_them() {
+    fn problems_leave_out_only_the_command_or_name_that_has_them() {
         let (wrappers, warnings) = parsed(
             r#"
 note = "hi"
 
 [[wrapper]]
-profiles = ["alpha", "default", "missing"]
+profiles = ["alpha", "default", "missing", "alpha"]
 launch = ["/bin/run", "{profile}"]
 lauch = ["/bin/typo"]
 
@@ -276,21 +281,19 @@ status = ["/bin/second"]
 [[wrapper]]
 profiles = ["gamma"]
 launch = ["bin/run"]
-
-[[wrapper]]
-profiles = ["gamma"]
 status = ["~/check"]
 
 [[wrapper]]
-profiles = ["gamma"]
-status = []
+profiles = ["delta"]
+launch = []
+status = ["~/"]
 
 [[wrapper]]
-profiles = "gamma"
+profiles = "omega"
 launch = ["/bin/run"]
 
 [[wrapper]]
-profiles = ["gamma"]
+profiles = ["omega"]
 "#,
             None,
         );
@@ -301,23 +304,56 @@ profiles = ["gamma"]
                 r#"codex-launcher.toml: wrapper 1: unknown key "lauch""#,
                 r#"codex-launcher.toml: wrapper 1: "default" always runs codex with config.toml alone"#,
                 r#"codex-launcher.toml: wrapper 1: no profile is named "missing""#,
-                r#"codex-launcher.toml: wrapper 2: an earlier wrapper already covers "alpha""#,
+                r#"codex-launcher.toml: wrapper 1: "alpha" is already named above"#,
+                r#"codex-launcher.toml: wrapper 2: "alpha" is already named above"#,
                 r#"codex-launcher.toml: wrapper 3: launch must start with an absolute path or ~/, not "bin/run""#,
-                "codex-launcher.toml: wrapper 4: status starts with ~/, but HOME is not set",
-                "codex-launcher.toml: wrapper 5: status must be a list of strings: the program, then its arguments",
-                "codex-launcher.toml: wrapper 6: profiles must be a list of profile names",
-                "codex-launcher.toml: wrapper 7: needs a launch command, a status command, or both",
+                "codex-launcher.toml: wrapper 3: status starts with ~/, but HOME is unset or not absolute",
+                "codex-launcher.toml: wrapper 4: launch must be a list of strings: the program, then its arguments",
+                "codex-launcher.toml: wrapper 4: status names no program after ~/",
+                "codex-launcher.toml: wrapper 5: profiles must be a list of profile names",
+                "codex-launcher.toml: wrapper 6: needs a launch command, a status command, or both",
             ]
         );
-        assert_eq!(wrappers.keys().collect::<Vec<_>>(), ["alpha", "beta"]);
+        let none = Wrapper {
+            launch: None,
+            status: None,
+        };
         assert_eq!(
-            wrappers["alpha"],
-            Wrapper {
-                launch: Some(program("/bin/run", &["alpha"])),
-                status: None,
-            }
+            wrappers,
+            BTreeMap::from([
+                (
+                    "alpha".to_owned(),
+                    Wrapper {
+                        launch: Some(program("/bin/run", &["alpha"])),
+                        status: None,
+                    }
+                ),
+                (
+                    "beta".to_owned(),
+                    Wrapper {
+                        launch: None,
+                        status: Some(program("/bin/second", &[])),
+                    }
+                ),
+                // Named with only broken commands, these still ignore PATH.
+                ("delta".to_owned(), none.clone()),
+                ("gamma".to_owned(), none.clone()),
+                ("omega".to_owned(), none),
+            ])
         );
-        assert_eq!(wrappers["beta"].status, Some(program("/bin/second", &[])));
+    }
+
+    #[test]
+    fn inline_tables_work_like_wrapper_tables() {
+        let (wrappers, warnings) = parsed(
+            r#"wrapper = [{ profiles = ["alpha"], launch = ["/bin/run", "{profile}"] }]"#,
+            None,
+        );
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(
+            wrappers["alpha"].launch,
+            Some(program("/bin/run", &["alpha"]))
+        );
     }
 
     #[test]

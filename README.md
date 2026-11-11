@@ -71,14 +71,16 @@ status = ["~/bin/lab-codex", "--status", "{profile}"]
 ```
 
 Each command is a program, then its arguments. `{profile}` becomes the
-profile's name, and the program must be an absolute path or start with `~/`.
-Launching `lab` runs `~/bin/lab-codex lab`, followed by any Codex arguments,
-including an [effort](#changing-effort) override. `status` is the profile's
-status command. An entry may give either command alone; without `launch`, the
-profile runs `codex --profile <name>`. A profile that the file names ignores
-`codex-<name>` and `codex-<name>.status` on `PATH`. The launcher reads the
-file when it starts, and warns about names that are not profiles, `default`,
-profiles named twice, and commands it cannot use.
+profile's name. The program must be an absolute path, or start with `~/` when
+`HOME` is absolute. Launching `lab` runs `~/bin/lab-codex lab`, followed by any
+Codex arguments, including an [effort](#changing-effort) override. `status` is
+the profile's status command. An entry may give either command alone; without
+`launch`, the profile runs `codex --profile <name>`. A profile that the file
+names ignores `codex-<name>` and `codex-<name>.status` on `PATH`.
+
+The launcher reads the file when it starts. It warns about names that are not
+profiles, `default`, profiles named twice, and commands it cannot use, and
+leaves those out. A profile whose commands are left out still ignores `PATH`.
 
 ![The details pane for lab, which one script launches and checks for both lab profiles](docs/images/wrappers.png)
 
