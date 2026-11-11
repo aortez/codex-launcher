@@ -618,6 +618,47 @@ mod tests {
     }
 
     #[test]
+    fn checks_close_their_connection_once_the_server_answers() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/v1/models",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            // Read up to the blank line that ends the request.
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let body = r#"{"data": [{"id": "m"}]}"#;
+            write!(
+                &stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            // An idle connection kept for reuse would stay open until this
+            // times out, and look like a connected client to the server.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).map(|_| rest.len())
+        });
+        let Reply::Models(models) = fetch(provider::client().unwrap(), url, HeaderMap::new())
+        else {
+            panic!("the stub lists a model");
+        };
+        assert_eq!(models, ["m"]);
+        let closed = server.join().unwrap();
+        assert_eq!(closed.ok(), Some(0), "the client kept the connection open");
+    }
+
+    #[test]
     fn unresolvable_hosts_are_reported_briefly() {
         // RFC 6761 reserves .invalid, so this name never resolves.
         let url = Url::parse("http://launcher-check.invalid/v1/models").unwrap();

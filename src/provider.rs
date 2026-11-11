@@ -18,10 +18,17 @@ use crate::profile::{self, BUILTIN_PROVIDERS, Profile};
 static CLIENT: OnceLock<std::result::Result<Client, reqwest::Error>> = OnceLock::new();
 
 /// The shared HTTP client. It never follows a redirect, which would carry the
-/// provider's headers to another server.
+/// provider's headers to another server. It keeps no idle connection either,
+/// so that a status command that counts a server's clients does not count the
+/// launcher.
 pub fn client() -> Result<&'static Client> {
     CLIENT
-        .get_or_init(|| Client::builder().redirect(Policy::none()).build())
+        .get_or_init(|| {
+            Client::builder()
+                .redirect(Policy::none())
+                .pool_max_idle_per_host(0)
+                .build()
+        })
         .as_ref()
         .map_err(|_| anyhow::anyhow!("could not initialize the HTTP client"))
 }
