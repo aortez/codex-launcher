@@ -103,6 +103,9 @@ impl Command {
 
     /// Replace this process with the command. Returns only on failure.
     pub fn exec(&self) -> anyhow::Error {
+        // Codex inherits this process, but not the threads that would kill
+        // helpers such as status commands when they run out of time.
+        crate::process::stop_all();
         let program: &OsStr = match &self.wrapper {
             Some(path) => path.as_os_str(),
             None => OsStr::new(&self.program),

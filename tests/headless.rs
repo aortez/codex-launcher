@@ -1235,6 +1235,66 @@ fn status_commands_report_for_wrappers_without_running_them() {
 }
 
 #[test]
+fn quitting_stops_status_commands_that_are_still_running() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Kill the sleeper even if an assertion fails, so a regression does not
+    // leave it running.
+    struct Sleeper(Pid);
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = kill_process(self.0, Signal::KILL);
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("slow.config.toml"), "model = 'm'\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let pid_file = bin.path().join("sleeper.pid");
+    let status = bin.path().join("codex-slow.status");
+    std::fs::write(
+        &status,
+        format!("#!/bin/sh\n/bin/sleep 60 &\nprintf '%s' \"$!\" > {pid_file:?}\nwait\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&status, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let launcher = Headless::launch(home.path(), &[], bin.path(), &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the status command never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _sleeper = Sleeper(Pid::from_raw(pid).unwrap());
+    launcher.ctl_json(&["quit"]);
+    launcher.finish();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"));
+        // The orphan may briefly remain a zombie until its reaper runs.
+        let running = status.is_ok_and(|s| {
+            !s.lines()
+                .any(|line| line.starts_with("State:") && line.contains("Z (zombie)"))
+        });
+        if !running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status command descendant {pid} outlived the menu"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn list_check_adds_server_states() {
     let server = OllamaServer::start();
     let home = server.home("toggle");

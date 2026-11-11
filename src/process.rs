@@ -3,7 +3,26 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, Signal, kill_process_group};
+
+/// The process groups of helpers that are still running.
+static RUNNING: Mutex<Running> = Mutex::new(Running {
+    groups: Vec::new(),
+    stopped: false,
+});
+
+struct Running {
+    groups: Vec<Pid>,
+    /// Whether the launcher is exiting, so that no more helpers may start.
+    stopped: bool,
+}
+
+fn running() -> MutexGuard<'static, Running> {
+    RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How a bounded run ended.
 pub enum Outcome {
@@ -20,16 +39,26 @@ pub enum Outcome {
 /// over the menu.
 ///
 /// The program runs in its own process group, which is killed afterwards:
-/// wrappers may leave descendants behind even after they exit.
+/// wrappers may leave descendants behind even after they exit. Fails once
+/// [`stop_all`] has run.
 pub fn run(command: &mut Command, deadline: Instant, max_bytes: u64) -> io::Result<Outcome> {
     let mut output = tempfile::tempfile()?;
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
-    let group = rustix::process::Pid::from_child(&child);
+        .process_group(0);
+    // Spawn under the lock, so that stop_all cannot miss the new group.
+    let (mut child, group) = {
+        let mut running = running();
+        if running.stopped {
+            return Err(io::Error::other("the launcher is exiting"));
+        }
+        let child = command.spawn()?;
+        let group = Pid::from_child(&child);
+        running.groups.push(group);
+        (child, group)
+    };
     let outcome = (|| {
         loop {
             if output.metadata()?.len() > max_bytes {
@@ -53,7 +82,19 @@ pub fn run(command: &mut Command, deadline: Instant, max_bytes: u64) -> io::Resu
         }
     })();
     // Terminate the group on every path, then reap the immediate child.
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    running().groups.retain(|&known| known != group);
+    let _ = kill_process_group(group, Signal::KILL);
     let _ = child.wait();
     outcome
+}
+
+/// Kill every helper that is still running, and refuse to start more. Call
+/// this before the launcher exits or becomes Codex: either way the threads
+/// waiting on helpers stop without killing them.
+pub fn stop_all() {
+    let mut running = running();
+    running.stopped = true;
+    for &group in &running.groups {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
 }

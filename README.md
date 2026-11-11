@@ -155,7 +155,8 @@ profile's mark. The other fields are optional:
 The command has ten seconds to finish, and its stderr is discarded. If it
 fails, prints anything else, or runs out of time, the profile is marked down
 and the `server` line says why. It runs in its own process group, which is
-killed afterwards, so its subprocesses do not keep running.
+killed once it finishes or runs out of time, or when you launch a profile or
+quit first, so its subprocesses do not keep running.
 
 For example, a wrapper that opens an SSH tunnel through a shared connection
 could come with this status command:

@@ -216,13 +216,17 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    match run(cli) {
+    let code = match run(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("codex-launcher: {error:#}");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Helpers that are still running, such as status commands that have yet
+    // to answer, would outlive the launcher.
+    process::stop_all();
+    code
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
