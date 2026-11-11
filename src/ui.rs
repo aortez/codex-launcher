@@ -439,7 +439,9 @@ fn mark(state: Option<State>) -> Span<'static> {
         State::ModelMissing => "! ",
         State::Down => "✗ ",
         State::Checking => "… ",
-        State::Skipped => "  ",
+        // A dim blank would show as a gray block under the selection's
+        // reverse video.
+        State::Skipped => return Span::raw("  "),
     };
     Span::styled(symbol, state_style(state))
 }
@@ -660,6 +662,30 @@ mod tests {
             "│                   the profile's file. ",
         ] {
             assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn selected_unchecked_profile_has_a_plain_highlight() {
+        // Only the default entry, whose built-in OpenAI provider is never checked.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "model = \"gpt-base\"\n").unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        app.check_servers();
+        assert_eq!(app.server_status_at(0).unwrap().state, State::Skipped);
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Every cell of the selected row, up to the list's right border, has
+        // the highlight's style.
+        let row: Vec<_> = (1..buffer.area.width)
+            .map(|x| &buffer[(x, 1)])
+            .take_while(|cell| cell.symbol() != "│")
+            .collect();
+        let text: String = row.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.starts_with(">   default"), "{text:?}");
+        for (column, cell) in row.iter().enumerate() {
+            assert_eq!(cell.style(), row[0].style(), "column {column} of {text:?}");
         }
     }
 
