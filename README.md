@@ -37,10 +37,11 @@ after a `default` entry that runs Codex with `config.toml` alone.
 
 The details pane shows the settings Codex will use. A value marked `(base)`
 comes from `config.toml` because the profile does not set it, and
-`(built-in)` marks Codex's own default. The `context` and `compact` rows show
-`model_context_window` and `model_auto_compact_token_limit` only when the
-profile or `config.toml` sets them. The description is the comment block at
-the top of the profile file. Values of keys that look like credentials
+`(built-in)` marks Codex's own default. The `context`
+(`model_context_window`) and `compact` (`model_auto_compact_token_limit`)
+lines appear only when the profile or `config.toml` sets them. The
+description is the comment block at the top of the profile file. Values of
+keys that look like credentials
 (`api_key`, `token`, `password`, header, `query_params`, and `env` tables, and
 so on), passwords inside URLs, and URL query values are shown as `<redacted>`. Environment variable names
 such as `env_key` stay visible.

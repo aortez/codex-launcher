@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn effort_context_and_compaction_show_together() {
+    fn context_and_compaction_show_beside_effort_when_set() {
         let (_home, mut app) = fixture_app();
         app.select_name("local").unwrap();
         let screen = render(&mut app, 100, 30);
@@ -580,6 +580,19 @@ mod tests {
         let screen = render(&mut app, 100, 30);
         assert!(!screen.contains("context "), "{screen}");
         assert!(!screen.contains("compact "), "{screen}");
+
+        // Each row depends only on its own key.
+        let home = fixture_home();
+        std::fs::write(
+            home.path().join("compact-only.config.toml"),
+            "model_auto_compact_token_limit = 1000\n",
+        )
+        .unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        app.select_name("compact-only").unwrap();
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("compact   1000"), "{screen}");
+        assert!(!screen.contains("context "), "{screen}");
     }
 
     #[test]
