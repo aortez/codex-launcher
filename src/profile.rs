@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
+use crate::wrappers::{self, Wrapper};
+
 /// The menu entry that runs Codex with only the base configuration.
 pub const DEFAULT_PROFILE: &str = "default";
 pub const DEFAULT_DESCRIPTION: &str = "Runs Codex with config.toml only, without a profile.";
@@ -111,6 +113,10 @@ pub struct Profile {
     pub raw: Option<String>,
     /// A read or parse problem that makes the settings incomplete.
     pub error: Option<String>,
+    /// The commands that codex-launcher.toml gives this profile. A profile's
+    /// launch [`Command`](crate::launch::Command) is built from this once, so
+    /// read that command for what runs.
+    pub wrapper: Option<Wrapper>,
 }
 
 impl Profile {
@@ -144,6 +150,14 @@ impl Catalog {
             .iter()
             .position(|profile| profile.name == name)
     }
+}
+
+/// The home directory, when `HOME` names an absolute path. A relative one
+/// would make `~/` paths depend on the current directory.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
 }
 
 /// Resolve the Codex home directory the same way Codex does.
@@ -202,6 +216,7 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         names.push(name.to_owned());
     }
     names.sort();
+    let mut wrappers = wrappers::load(codex_home, &names, home_dir().as_deref(), &mut warnings);
 
     let mut profiles = Vec::with_capacity(names.len() + 1);
     profiles.push(build_profile(
@@ -215,7 +230,9 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         let path = codex_home.join(format!("{name}{PROFILE_SUFFIX}"));
         let file = read_config(&path);
         let layer = file.document.as_ref().map(DocumentMut::as_table);
-        profiles.push(build_profile(name, path, &file, layer, base));
+        let mut profile = build_profile(name, path, &file, layer, base);
+        profile.wrapper = wrappers.remove(&profile.name);
+        profiles.push(profile);
     }
 
     Ok(Catalog {
@@ -325,7 +342,7 @@ fn read_config(path: &Path) -> ConfigFile {
     }
 }
 
-fn read_limited(path: &Path) -> std::io::Result<String> {
+pub(crate) fn read_limited(path: &Path) -> std::io::Result<String> {
     let size = fs::metadata(path)?.len();
     if size > MAX_CONFIG_BYTES {
         return Err(std::io::Error::new(
@@ -398,6 +415,7 @@ fn build_profile(
         approval: setting(layer, base, "approval_policy"),
         raw,
         error: file.error.clone(),
+        wrapper: None,
     }
 }
 

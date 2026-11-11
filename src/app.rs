@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::check::{self, Checks, State};
 use crate::effort::{self, Choices};
-use crate::launch::Command;
+use crate::launch::{Command, Program};
 use crate::profile::{self, Catalog, Profile, Provider, Setting, Source};
 
 /// A key press, from the terminal or from `ctl key`.
@@ -800,6 +800,9 @@ pub struct ProfileView<'a> {
     pub command: Vec<String>,
     pub command_line: String,
     pub wrapper: Option<String>,
+    /// The status command that server checks run, when there is one, as a
+    /// shell-quoted line.
+    pub status_command: Option<String>,
     pub error: Option<&'a str>,
     /// The redacted file text, included only on request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -826,6 +829,7 @@ impl<'a> ProfileView<'a> {
                 .wrapper
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            status_command: command.status.as_ref().map(Program::display),
             error: profile.error.as_deref(),
             file: if with_file {
                 profile.raw.as_deref()

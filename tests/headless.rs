@@ -1099,7 +1099,7 @@ fn server_checks_mark_profiles_and_recheck_on_demand() {
     let state = launcher.ctl_json(&["select", "wrapped"]);
     assert_eq!(
         state["profile"]["server"]["message"],
-        "launched through codex-wrapped"
+        "launched through codex-wrapped, and no codex-wrapped.status is on PATH"
     );
     launcher.ctl_json(&["select", "offline"]);
     let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
@@ -1133,6 +1133,428 @@ fn server_checks_mark_profiles_and_recheck_on_demand() {
     assert_eq!(state["menu"][2]["server"], "ready");
     assert_eq!(server.requests.try_iter().count(), 1);
     launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn status_commands_report_for_wrappers_without_running_them() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "model = 'base'\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let launched = bin.path().join("launched");
+    let executable = |name: String, text: String| {
+        let path = bin.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let allocates = r#"{"state": "ready", "context_window": 32768}"#;
+    for (name, context, report) in [
+        ("auto", None, allocates),
+        ("broken", Some(65536), "not json"),
+        (
+            "busy",
+            Some(65536),
+            r#"{"state": "busy", "message": "another session holds the server"}"#,
+        ),
+        ("even", Some(32768), allocates),
+        (
+            "idle",
+            Some(65536),
+            r#"{"state": "starts_on_launch", "drafting": "on"}"#,
+        ),
+        ("up", Some(65536), allocates),
+    ] {
+        let mut config = "model = 'm'\n".to_owned();
+        if let Some(tokens) = context {
+            config.push_str(&format!("model_context_window = {tokens}\n"));
+        }
+        std::fs::write(home.path().join(format!("{name}.config.toml")), config).unwrap();
+        // The wrapper would start the server, so a check must never run it.
+        // The PATH holds nothing else, so it uses only shell built-ins.
+        executable(
+            format!("codex-{name}"),
+            format!("#!/bin/sh\n: > {launched:?}\n"),
+        );
+        executable(
+            format!("codex-{name}.status"),
+            format!("#!/bin/sh\nprintf '%s' '{report}'\n"),
+        );
+    }
+
+    let launcher = Headless::launch(home.path(), &[], bin.path(), &[]);
+    let state = launcher.checked_state();
+    let servers: Vec<_> = state["menu"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap(),
+                entry["server"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        servers,
+        [
+            ("default", "skipped"),
+            ("auto", "ready"),
+            ("broken", "down"),
+            ("busy", "busy"),
+            ("even", "ready"),
+            ("idle", "starts_on_launch"),
+            ("up", "ready"),
+        ]
+    );
+    let state = launcher.ctl_json(&["select", "broken"]);
+    let message = state["profile"]["server"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("codex-broken.status printed no valid status: "),
+        "{message}"
+    );
+    let state = launcher.ctl_json(&["select", "busy"]);
+    assert_eq!(
+        state["profile"]["server"],
+        serde_json::json!({"state": "busy", "message": "another session holds the server"})
+    );
+    let screen_of = |profile: &str| {
+        launcher.ctl_json(&["select", profile]);
+        String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap()
+    };
+    let status_path = bin.path().join("codex-up.status");
+    let state = launcher.ctl_json(&["select", "up"]);
+    assert_eq!(state["profile"]["server"]["context_window"], 32768);
+    assert_eq!(
+        state["profile"]["status_command"],
+        status_path.to_str().unwrap()
+    );
+    let screen = screen_of("up");
+    for expected in [
+        "│  ✗ broken".to_owned(),
+        "│  ◉ busy".to_owned(),
+        "│  ◌ idle".to_owned(),
+        "│> ✓ up".to_owned(),
+        "server    ready".to_owned(),
+        "context   65536  server allocates 32768".to_owned(),
+        format!("status    {}", status_path.display()),
+    ] {
+        assert!(
+            screen.contains(&expected),
+            "{expected:?} missing:\n{screen}"
+        );
+    }
+    let screen = screen_of("auto");
+    assert!(
+        screen.contains("context   (Codex default)  server allocates 32768"),
+        "{screen}"
+    );
+    let screen = screen_of("even");
+    assert!(screen.contains("context   32768"), "{screen}");
+    assert!(!screen.contains("server allocates"), "{screen}");
+    let screen = screen_of("idle");
+    for expected in [
+        "server    starts on launch",
+        "context   65536",
+        "drafting  on",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+    assert!(!screen.contains("server allocates"), "{screen}");
+    launcher.ctl_json(&["quit"]);
+
+    // With another provider, Codex would not use the server the command checks.
+    let launcher = Headless::launch(home.path(), &["--", "--oss"], bin.path(), &[]);
+    launcher.checked_state();
+    let state = launcher.ctl_json(&["select", "up"]);
+    assert_eq!(
+        state["profile"]["server"],
+        serde_json::json!({"state": "skipped", "message": "launch arguments select the profile or provider"})
+    );
+    launcher.ctl_json(&["quit"]);
+
+    let output = Command::new(BIN)
+        .args(["list", "--check", "--json"])
+        .env("CODEX_HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let server_of = |profile: &str| {
+        let listed = listed.as_array().unwrap();
+        listed
+            .iter()
+            .find(|entry| entry["name"] == profile)
+            .unwrap()["server"]
+            .clone()
+    };
+    assert_eq!(
+        server_of("idle"),
+        serde_json::json!({"state": "starts_on_launch", "message": null, "drafting": "on"})
+    );
+    assert_eq!(
+        server_of("up"),
+        serde_json::json!({"state": "ready", "message": null, "context_window": 32768})
+    );
+    assert!(!launched.exists(), "a server check ran a wrapper");
+}
+
+#[test]
+fn codex_launcher_toml_names_launch_and_status_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let codex_home = home.path().join(".codex");
+    std::fs::create_dir(&codex_home).unwrap();
+    for name in ["alpha", "beta", "plain"] {
+        std::fs::write(
+            codex_home.join(format!("{name}.config.toml")),
+            "model = 'm'\n",
+        )
+        .unwrap();
+    }
+    let launched = home.path().join("launched");
+    let executable = |path: PathBuf, text: String| {
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    // One script serves every profile, and reports instead with --status. The
+    // PATH holds nothing else, so it uses only shell built-ins.
+    std::fs::create_dir(home.path().join("bin")).unwrap();
+    let run = home.path().join("bin/run");
+    executable(
+        run.clone(),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --status ]; then\n  printf '{{\"state\": \"busy\", \"message\": \"%s is busy\"}}' \"$2\"\nelse\n  : > {launched:?}\nfi\n"
+        ),
+    );
+    // The file takes precedence over these, even where its commands are broken.
+    let bin = tempfile::tempdir().unwrap();
+    for name in ["codex-alpha", "codex-beta"] {
+        executable(
+            bin.path().join(name),
+            format!("#!/bin/sh\n: > {launched:?}\n"),
+        );
+    }
+    executable(
+        bin.path().join("codex-alpha.status"),
+        "#!/bin/sh\nprintf '{\"state\": \"ready\"}'\n".to_owned(),
+    );
+    let config = codex_home.join("codex-launcher.toml");
+    std::fs::write(
+        &config,
+        r#"
+[[wrapper]]
+profiles = ["alpha", "missing"]
+launch = ["~/bin/run", "{profile}"]
+status = ["~/bin/run", "--status", "{profile}"]
+
+[[wrapper]]
+profiles = ["beta"]
+launch = ["~/bin/run", "{profile}"]
+status = ["bin/run", "--status", "{profile}"]
+
+[[wrapper]]
+profiles = ["plain"]
+launch = ["~/bin/absent"]
+"#,
+    )
+    .unwrap();
+    let launcher_with_home = |args: &[&str], home_var: &Path| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(home.path())
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home_var)
+            .env("PATH", bin.path())
+            .output()
+            .unwrap()
+    };
+    let launcher = |args: &[&str]| launcher_with_home(args, home.path());
+    let warnings = "codex-launcher: warning: codex-launcher.toml: wrapper 1: no profile is named \"missing\"\n\
+        codex-launcher: warning: codex-launcher.toml: wrapper 2: status must start with an absolute path or ~/, not \"bin/run\"\n";
+
+    let output = launcher(&["list", "--check", "--json"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry_in = |listed: &Value, profile: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == profile)
+            .unwrap()
+            .clone()
+    };
+    let entry = |profile: &str| entry_in(&listed, profile);
+    let run_path = run.to_str().unwrap();
+    let alpha = entry("alpha");
+    assert_eq!(
+        alpha["server"],
+        serde_json::json!({"state": "busy", "message": "alpha is busy"})
+    );
+    assert_eq!(alpha["command"], serde_json::json!([run_path, "alpha"]));
+    assert_eq!(alpha["wrapper"], run_path);
+    assert_eq!(
+        alpha["status_command"],
+        format!("{run_path} --status alpha")
+    );
+    // Its broken status command is left out, but codex-beta still is not used.
+    let beta = entry("beta");
+    assert_eq!(beta["command"], serde_json::json!([run_path, "beta"]));
+    assert_eq!(
+        beta["server"],
+        serde_json::json!({"state": "skipped", "message": "launched through run, and codex-launcher.toml gives it no status command"})
+    );
+
+    // Launching directly or showing a profile prints the warnings too.
+    let output = launcher(&["beta", "--dry-run"]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{run_path} beta\n")
+    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
+    let output = launcher(&["show", "beta"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), warnings);
+    let output = launcher(&["plain"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "{warnings}codex-launcher: cannot run {}: No such file or directory (os error 2)\n",
+            home.path().join("bin/absent").display()
+        )
+    );
+
+    // A relative HOME would make ~/ depend on the current directory, which
+    // here holds bin/run.
+    let output = launcher_with_home(&["list", "--check", "--json"], Path::new("."));
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for key in ["launch", "status"] {
+        let warning = format!("wrapper 1: {key} starts with ~/, but HOME is unset or not absolute");
+        assert!(stderr.contains(&warning), "{warning:?} missing:\n{stderr}");
+    }
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alpha = entry_in(&listed, "alpha");
+    assert_eq!(
+        alpha["command"],
+        serde_json::json!(["codex", "--profile", "alpha"])
+    );
+    assert_eq!(alpha["status_command"], Value::Null);
+
+    // An effort override goes after the wrapper's own arguments.
+    let menu = Headless::launch(
+        &codex_home,
+        &["--no-check", "--", "exec", "hi"],
+        bin.path(),
+        &[("HOME", home.path().to_str())],
+    );
+    menu.ctl_json(&["select", "alpha"]);
+    let state = menu.ctl_json(&["effort", "high"]);
+    assert_eq!(
+        state["profile"]["command"],
+        serde_json::json!([
+            run_path,
+            "alpha",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "exec",
+            "hi"
+        ])
+    );
+    let screen_has = |expected: &[&str]| {
+        let screen = String::from_utf8(menu.ctl(&["screen"]).stdout).unwrap();
+        for expected in expected {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        assert!(!screen.contains("wrapper "), "{screen}");
+    };
+    screen_has(&[
+        "launch    ~/bin/run alpha -c 'model_reasoning_effort=\"high\"' exec hi",
+        "status    ~/bin/run --status alpha",
+    ]);
+    // Saving reloads the profiles, but what runs and what shows still come
+    // from the file as it was when the menu opened.
+    std::fs::remove_file(&config).unwrap();
+    let state = menu.ctl_json(&["save-effort"]);
+    assert_eq!(
+        state["profile"]["command"],
+        serde_json::json!([run_path, "alpha", "exec", "hi"])
+    );
+    screen_has(&[
+        "launch    ~/bin/run alpha exec hi",
+        "status    ~/bin/run --status alpha",
+    ]);
+    menu.ctl_json(&["launch"]);
+    assert_eq!(menu.finish(), format!("{run_path} alpha exec hi\n"));
+    let saved = std::fs::read_to_string(codex_home.join("alpha.config.toml")).unwrap();
+    assert!(
+        saved.contains("model_reasoning_effort = \"high\""),
+        "{saved}"
+    );
+    assert!(!launched.exists(), "a server check ran a wrapper");
+}
+
+#[test]
+fn quitting_stops_status_commands_that_are_still_running() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Kill the sleeper even if an assertion fails, so a regression does not
+    // leave it running.
+    struct Sleeper(Pid);
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = kill_process(self.0, Signal::KILL);
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("slow.config.toml"), "model = 'm'\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let pid_file = bin.path().join("sleeper.pid");
+    let status = bin.path().join("codex-slow.status");
+    std::fs::write(
+        &status,
+        format!("#!/bin/sh\n/bin/sleep 60 &\nprintf '%s' \"$!\" > {pid_file:?}\nwait\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&status, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let launcher = Headless::launch(home.path(), &[], bin.path(), &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the status command never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _sleeper = Sleeper(Pid::from_raw(pid).unwrap());
+    launcher.ctl_json(&["quit"]);
+    launcher.finish();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"));
+        // The orphan may briefly remain a zombie until its reaper runs.
+        let running = status.is_ok_and(|s| {
+            !s.lines()
+                .any(|line| line.starts_with("State:") && line.contains("Z (zombie)"))
+        });
+        if !running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status command descendant {pid} outlived the menu"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

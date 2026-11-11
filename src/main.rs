@@ -6,14 +6,16 @@ mod control;
 mod effort;
 mod launch;
 mod ollama;
+mod process;
 mod profile;
 mod provider;
 mod tui;
 mod ui;
+mod wrappers;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -33,7 +35,10 @@ const AFTER_HELP: &str = "\
 Profiles are $CODEX_HOME/<name>.config.toml files (CODEX_HOME defaults to
 ~/.codex). \"default\" runs Codex with config.toml alone. When an executable
 named codex-<name> is on PATH, launching <name> runs it instead of
-`codex --profile <name>`; the wrapper must select the profile itself.
+`codex --profile <name>`; the wrapper must select the profile itself. Server
+checks never run a wrapper, but run codex-<name>.status when it is on PATH.
+A profile named in $CODEX_HOME/codex-launcher.toml ignores both, and uses the
+launch and status commands that the file gives it; see the README.
 
 In the menu, press ? to see what the keys and the server marks mean.
 
@@ -214,13 +219,17 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    match run(cli) {
+    let code = match run(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("codex-launcher: {error:#}");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Helpers that are still running, such as status commands that have yet
+    // to answer, would outlive the launcher.
+    process::stop_all();
+    code
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -240,12 +249,6 @@ fn path_var() -> Option<OsString> {
     std::env::var_os("PATH")
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-}
-
 fn print_warnings(catalog: &Catalog) {
     for warning in &catalog.warnings {
         eprintln!("codex-launcher: warning: {warning}");
@@ -262,6 +265,8 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
         let profile = catalog
             .find(name)
             .ok_or_else(|| anyhow::anyhow!(unknown_profile(&catalog, name)))?;
+        // A problem in codex-launcher.toml can change what runs.
+        print_warnings(&catalog);
         let command = Command::for_profile(profile, &cli.codex_args, path.as_deref());
         if cli.dry_run {
             println!("{}", command.display());
@@ -270,7 +275,12 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
         return Err(command.exec());
     }
 
-    let mut app = App::new(catalog, &cli.codex_args, path.as_deref(), home_dir());
+    let mut app = App::new(
+        catalog,
+        &cli.codex_args,
+        path.as_deref(),
+        profile::home_dir(),
+    );
     print_warnings(app.catalog());
     if !cli.no_check {
         app.check_servers();
@@ -364,6 +374,7 @@ fn show(catalog: &Catalog, name: &str, json: bool) -> Result<ExitCode> {
     let profile = catalog
         .find(name)
         .ok_or_else(|| anyhow::anyhow!(unknown_profile(catalog, name)))?;
+    print_warnings(catalog);
     let path = path_var();
     if json {
         let command = Command::for_profile(profile, &[], path.as_deref());
@@ -372,7 +383,7 @@ fn show(catalog: &Catalog, name: &str, json: bool) -> Result<ExitCode> {
         ))?)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let mut app = App::new(catalog.clone(), &[], path.as_deref(), home_dir());
+    let mut app = App::new(catalog.clone(), &[], path.as_deref(), profile::home_dir());
     app.select_name(name).map_err(anyhow::Error::msg)?;
     let mut out = io::stdout().lock();
     for line in ui::details(&app).lines {

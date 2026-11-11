@@ -6,6 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use crate::profile::Profile;
+use crate::wrappers::Wrapper;
 
 /// The Codex executable, resolved through `PATH` when it runs.
 pub const CODEX: &str = "codex";
@@ -13,38 +14,69 @@ pub const CODEX: &str = "codex";
 /// The profile name whose wrapper would be this launcher itself.
 const SELF_NAME: &str = "launcher";
 
+/// A program to run, with its arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    pub path: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl Program {
+    /// The command as a shell-quoted line.
+    pub fn display(&self) -> String {
+        shell_line(
+            std::iter::once(self.path.to_string_lossy().into_owned())
+                .chain(self.args.iter().cloned()),
+        )
+    }
+}
+
 /// The command that launching a profile runs.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     /// The program name shown to the user.
     pub program: String,
     pub args: Vec<String>,
-    /// The resolved `codex-<profile>` wrapper, when one is on `PATH`.
+    /// How many of `args` belong to the wrapper itself. The Codex arguments,
+    /// such as an effort override, follow them.
+    pub wrapper_arg_count: usize,
+    /// Whether codex-launcher.toml gave this profile its commands, so that
+    /// `PATH` was not searched.
+    pub configured: bool,
+    /// The wrapper that launching runs: the resolved `codex-<profile>` on
+    /// `PATH`, or the launch command that codex-launcher.toml gives.
     pub wrapper: Option<PathBuf>,
+    /// The command that server checks run instead of asking the server: the
+    /// resolved `codex-<profile>.status` on `PATH`, or the status command that
+    /// codex-launcher.toml gives.
+    pub status: Option<Program>,
 }
 
 impl Command {
     /// Override effort before subcommands/prompts, removing competing config
-    /// flags while leaving literal arguments after `--` alone.
+    /// flags while leaving literal arguments after `--` alone. A wrapper's own
+    /// arguments stay first and unchanged.
     pub fn with_effort(&self, effort: &str) -> Self {
         let mut command = self.clone();
-        command.args = vec![
+        let (own, codex) = self.args.split_at(self.wrapper_arg_count);
+        command.args = own.to_vec();
+        command.args.extend([
             "-c".to_owned(),
             format!("model_reasoning_effort={}", toml_edit::Value::from(effort)),
-        ];
+        ]);
         let mut index = 0;
-        while index < self.args.len() {
-            if self.args[index] == "--" {
-                command.args.extend_from_slice(&self.args[index..]);
+        while index < codex.len() {
+            if codex[index] == "--" {
+                command.args.extend_from_slice(&codex[index..]);
                 break;
             }
-            if let Some((count, assignment)) = crate::effort::config_argument(&self.args, index)
+            if let Some((count, assignment)) = crate::effort::config_argument(codex, index)
                 && crate::effort::is_effort_assignment(assignment)
             {
                 index += count;
                 continue;
             }
-            command.args.push(self.args[index].clone());
+            command.args.push(codex[index].clone());
             index += 1;
         }
         command
@@ -52,29 +84,77 @@ impl Command {
 
     /// Build the command for `profile`, with `extra` arguments passed through.
     ///
-    /// A profile named `NAME` runs `codex-NAME` instead of `codex --profile NAME`
-    /// when that executable is on `path`. The wrapper is expected to select the
-    /// profile itself.
+    /// A profile that codex-launcher.toml names runs the commands it gives.
+    /// Otherwise a profile named `NAME` runs `codex-NAME` instead of
+    /// `codex --profile NAME` when that executable is on `path`. Either
+    /// wrapper is expected to select the profile itself.
     pub fn for_profile(profile: &Profile, extra: &[String], path: Option<&OsStr>) -> Self {
-        let wrapper = if profile.is_default() {
-            None
-        } else {
-            find_wrapper(&profile.name, path)
+        let mut command = match &profile.wrapper {
+            Some(configured) => Self::configured(profile, configured),
+            None => Self::found(profile, path),
         };
-        let mut args = Vec::new();
-        let program = if wrapper.is_some() {
-            wrapper_name(&profile.name)
-        } else {
-            if !profile.is_default() {
-                args.extend(profile_args(&profile.name));
-            }
-            CODEX.to_owned()
-        };
-        args.extend(extra.iter().cloned());
+        command.args.extend(extra.iter().cloned());
+        command
+    }
+
+    /// `codex --profile NAME`, or `codex` alone for the default entry.
+    fn plain(profile: &Profile) -> Self {
         Self {
-            program,
-            args,
-            wrapper,
+            program: CODEX.to_owned(),
+            args: if profile.is_default() {
+                Vec::new()
+            } else {
+                profile_args(&profile.name)
+            },
+            wrapper_arg_count: 0,
+            configured: false,
+            wrapper: None,
+            status: None,
+        }
+    }
+
+    /// The commands that codex-launcher.toml gives `profile`.
+    fn configured(profile: &Profile, configured: &Wrapper) -> Self {
+        let status = configured.status.clone();
+        match &configured.launch {
+            Some(launch) => Self {
+                program: launch.path.to_string_lossy().into_owned(),
+                args: launch.args.clone(),
+                wrapper_arg_count: launch.args.len(),
+                configured: true,
+                wrapper: Some(launch.path.clone()),
+                status,
+            },
+            None => Self {
+                configured: true,
+                status,
+                ..Self::plain(profile)
+            },
+        }
+    }
+
+    /// The `codex-NAME` wrapper and `codex-NAME.status` command on `path`.
+    fn found(profile: &Profile, path: Option<&OsStr>) -> Self {
+        if profile.is_default() {
+            return Self::plain(profile);
+        }
+        let status = find_status(&profile.name, path).map(|path| Program {
+            path,
+            args: Vec::new(),
+        });
+        match find_wrapper(&profile.name, path) {
+            Some(wrapper) => Self {
+                program: wrapper_name(&profile.name),
+                args: Vec::new(),
+                wrapper_arg_count: 0,
+                configured: false,
+                wrapper: Some(wrapper),
+                status,
+            },
+            None => Self {
+                status,
+                ..Self::plain(profile)
+            },
         }
     }
 
@@ -87,21 +167,21 @@ impl Command {
 
     /// The command as a shell-quoted line.
     pub fn display(&self) -> String {
-        self.argv()
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ")
+        shell_line(self.argv())
     }
 
     /// Replace this process with the command. Returns only on failure.
     pub fn exec(&self) -> anyhow::Error {
+        // Codex inherits this process, but not the threads that would kill
+        // helpers such as status commands when they run out of time.
+        crate::process::stop_all();
         let program: &OsStr = match &self.wrapper {
             Some(path) => path.as_os_str(),
             None => OsStr::new(&self.program),
         };
         let error = std::process::Command::new(program).args(&self.args).exec();
-        if error.kind() == std::io::ErrorKind::NotFound {
+        // Only a program without a path is looked up on PATH.
+        if error.kind() == std::io::ErrorKind::NotFound && self.wrapper.is_none() {
             anyhow::anyhow!("cannot run {}: not found on PATH", self.program)
         } else {
             anyhow::anyhow!("cannot run {}: {error}", self.program)
@@ -112,6 +192,12 @@ impl Command {
 /// The wrapper executable name for a profile.
 pub fn wrapper_name(profile: &str) -> String {
     format!("{CODEX}-{profile}")
+}
+
+/// The status command's executable name for a profile. Profile names cannot
+/// contain a dot, so it never names another profile's wrapper.
+pub fn status_name(profile: &str) -> String {
+    format!("{}.status", wrapper_name(profile))
 }
 
 /// Codex arguments that select a profile.
@@ -133,6 +219,17 @@ fn find_wrapper(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     find_executable(&name, path)
 }
 
+/// Find an executable `codex-<profile>.status` on `path`. A status command
+/// runs as soon as the menu opens, so unlike a wrapper it never comes from a
+/// relative entry such as `.`, which would run what the current directory holds.
+fn find_status(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = status_name(profile);
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| is_executable(candidate))
+}
+
 pub fn find_executable(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path?)
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -144,6 +241,15 @@ fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Words as one line for a POSIX shell, quoted where they need it.
+fn shell_line(words: impl IntoIterator<Item = String>) -> String {
+    words
+        .into_iter()
+        .map(|word| shell_quote(&word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Quote `arg` for a POSIX shell when it needs quoting.
@@ -222,6 +328,132 @@ mod tests {
 
         let launcher = Command::for_profile(catalog.find("launcher").unwrap(), &[], Some(&path));
         assert_eq!(launcher.argv(), ["codex", "--profile", "launcher"]);
+    }
+
+    #[test]
+    fn status_command_comes_from_path_for_named_profiles() {
+        let (_home, catalog) = catalog(&["work"]);
+        let bin = tempfile::tempdir().unwrap();
+        executable(bin.path(), "codex-work.status");
+        executable(bin.path(), "codex-default.status");
+        let path = Some(bin.path().as_os_str());
+
+        let work = Command::for_profile(catalog.find("work").unwrap(), &[], path);
+        assert_eq!(
+            work.status,
+            Some(Program {
+                path: bin.path().join("codex-work.status"),
+                args: Vec::new(),
+            })
+        );
+        // A status command does not change what launching runs.
+        assert_eq!(work.argv(), ["codex", "--profile", "work"]);
+
+        let default = Command::for_profile(catalog.find("default").unwrap(), &[], path);
+        assert_eq!(default.status, None);
+
+        // The same directory, named relative to the current one.
+        let relative: PathBuf = std::env::current_dir()
+            .unwrap()
+            .components()
+            .skip(1)
+            .map(|_| "..")
+            .collect::<PathBuf>()
+            .join(bin.path().strip_prefix("/").unwrap());
+        assert!(is_executable(&relative.join("codex-work.status")));
+        let work = Command::for_profile(
+            catalog.find("work").unwrap(),
+            &[],
+            Some(relative.as_os_str()),
+        );
+        assert_eq!(work.status, None);
+    }
+
+    #[test]
+    fn configured_commands_replace_the_path_conventions() {
+        let (_home, mut catalog) = catalog(&["watched", "work"]);
+        let bin = tempfile::tempdir().unwrap();
+        for name in ["codex-work", "codex-work.status", "codex-watched"] {
+            executable(bin.path(), name);
+        }
+        let path = Some(bin.path().as_os_str());
+        let check = Program {
+            path: PathBuf::from("/opt/check"),
+            args: vec!["--status".to_owned(), "watched".to_owned()],
+        };
+        let configure = |catalog: &mut profile::Catalog, name: &str, wrapper: Wrapper| {
+            let index = catalog.index_of(name).unwrap();
+            catalog.profiles[index].wrapper = Some(wrapper);
+        };
+        configure(
+            &mut catalog,
+            "work",
+            Wrapper {
+                launch: Some(Program {
+                    path: PathBuf::from("/opt/run"),
+                    // The wrapper's own arguments, even one that looks like
+                    // an effort setting, are not Codex's to change.
+                    args: ["work", "-c", "model_reasoning_effort=own"]
+                        .map(str::to_owned)
+                        .into(),
+                }),
+                status: None,
+            },
+        );
+        configure(
+            &mut catalog,
+            "watched",
+            Wrapper {
+                launch: None,
+                status: Some(check.clone()),
+            },
+        );
+
+        let extra = ["-c", "model_reasoning_effort=low", "exec", "two words"].map(str::to_owned);
+        let work = Command::for_profile(catalog.find("work").unwrap(), &extra, path);
+        assert_eq!(
+            work.argv(),
+            [
+                "/opt/run",
+                "work",
+                "-c",
+                "model_reasoning_effort=own",
+                "-c",
+                "model_reasoning_effort=low",
+                "exec",
+                "two words"
+            ]
+        );
+        assert_eq!(work.wrapper, Some(PathBuf::from("/opt/run")));
+        assert_eq!(work.status, None);
+        assert_eq!(
+            work.with_effort("high").argv(),
+            [
+                "/opt/run",
+                "work",
+                "-c",
+                "model_reasoning_effort=own",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "exec",
+                "two words"
+            ]
+        );
+
+        let watched = Command::for_profile(catalog.find("watched").unwrap(), &[], path);
+        assert_eq!(watched.argv(), ["codex", "--profile", "watched"]);
+        assert_eq!(watched.wrapper, None);
+        assert_eq!(watched.status, Some(check));
+        assert_eq!(
+            watched.with_effort("high").argv(),
+            [
+                "codex",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "--profile",
+                "watched"
+            ]
+        );
     }
 
     #[test]
