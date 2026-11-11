@@ -64,7 +64,7 @@ impl Command {
         } else {
             (
                 find_wrapper(&profile.name, path),
-                find_executable(&status_name(&profile.name), path),
+                find_status(&profile.name, path),
             )
         };
         let mut args = Vec::new();
@@ -147,6 +147,17 @@ fn find_wrapper(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     }
     let name = wrapper_name(profile);
     find_executable(&name, path)
+}
+
+/// Find an executable `codex-<profile>.status` on `path`. A status command
+/// runs as soon as the menu opens, so unlike a wrapper it never comes from a
+/// relative entry such as `.`, which would run what the current directory holds.
+fn find_status(profile: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = status_name(profile);
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| is_executable(candidate))
 }
 
 pub fn find_executable(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
@@ -255,6 +266,22 @@ mod tests {
 
         let default = Command::for_profile(catalog.find("default").unwrap(), &[], path);
         assert_eq!(default.status, None);
+
+        // The same directory, named relative to the current one.
+        let relative: PathBuf = std::env::current_dir()
+            .unwrap()
+            .components()
+            .skip(1)
+            .map(|_| "..")
+            .collect::<PathBuf>()
+            .join(bin.path().strip_prefix("/").unwrap());
+        assert!(is_executable(&relative.join("codex-work.status")));
+        let work = Command::for_profile(
+            catalog.find("work").unwrap(),
+            &[],
+            Some(relative.as_os_str()),
+        );
+        assert_eq!(work.status, None);
     }
 
     #[test]

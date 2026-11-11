@@ -800,6 +800,8 @@ pub struct ProfileView<'a> {
     pub command: Vec<String>,
     pub command_line: String,
     pub wrapper: Option<String>,
+    /// The status command that server checks run, when there is one.
+    pub status_command: Option<String>,
     pub error: Option<&'a str>,
     /// The redacted file text, included only on request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -824,6 +826,10 @@ impl<'a> ProfileView<'a> {
             command_line: command.display(),
             wrapper: command
                 .wrapper
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            status_command: command
+                .status
                 .as_ref()
                 .map(|path| path.display().to_string()),
             error: profile.error.as_deref(),

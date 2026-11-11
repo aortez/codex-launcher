@@ -1099,7 +1099,7 @@ fn server_checks_mark_profiles_and_recheck_on_demand() {
     let state = launcher.ctl_json(&["select", "wrapped"]);
     assert_eq!(
         state["profile"]["server"]["message"],
-        "launched through codex-wrapped, which has no codex-wrapped.status"
+        "launched through codex-wrapped, and no codex-wrapped.status is on PATH"
     );
     launcher.ctl_json(&["select", "offline"]);
     let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
@@ -1147,20 +1147,28 @@ fn status_commands_report_for_wrappers_without_running_them() {
         std::fs::write(&path, text).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     };
-    for (name, report) in [
-        ("broken", "not json"),
+    let allocates = r#"{"state": "ready", "context_window": 32768}"#;
+    for (name, context, report) in [
+        ("auto", None, allocates),
+        ("broken", Some(65536), "not json"),
         (
             "busy",
+            Some(65536),
             r#"{"state": "busy", "message": "another session holds the server"}"#,
         ),
-        ("idle", r#"{"state": "starts_on_launch", "drafting": "on"}"#),
-        ("up", r#"{"state": "ready", "context_window": 32768}"#),
+        ("even", Some(32768), allocates),
+        (
+            "idle",
+            Some(65536),
+            r#"{"state": "starts_on_launch", "drafting": "on"}"#,
+        ),
+        ("up", Some(65536), allocates),
     ] {
-        std::fs::write(
-            home.path().join(format!("{name}.config.toml")),
-            "model = 'm'\nmodel_context_window = 65536\n",
-        )
-        .unwrap();
+        let mut config = "model = 'm'\n".to_owned();
+        if let Some(tokens) = context {
+            config.push_str(&format!("model_context_window = {tokens}\n"));
+        }
+        std::fs::write(home.path().join(format!("{name}.config.toml")), config).unwrap();
         // The wrapper would start the server, so a check must never run it.
         // The PATH holds nothing else, so it uses only shell built-ins.
         executable(
@@ -1190,8 +1198,10 @@ fn status_commands_report_for_wrappers_without_running_them() {
         servers,
         [
             ("default", "skipped"),
+            ("auto", "ready"),
             ("broken", "down"),
             ("busy", "busy"),
+            ("even", "ready"),
             ("idle", "starts_on_launch"),
             ("up", "ready"),
         ]
@@ -1207,21 +1217,41 @@ fn status_commands_report_for_wrappers_without_running_them() {
         state["profile"]["server"],
         serde_json::json!({"state": "busy", "message": "another session holds the server"})
     );
+    let screen_of = |profile: &str| {
+        launcher.ctl_json(&["select", profile]);
+        String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap()
+    };
+    let status_path = bin.path().join("codex-up.status");
     let state = launcher.ctl_json(&["select", "up"]);
     assert_eq!(state["profile"]["server"]["context_window"], 32768);
-    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert_eq!(
+        state["profile"]["status_command"],
+        status_path.to_str().unwrap()
+    );
+    let screen = screen_of("up");
     for expected in [
-        "│  ✗ broken",
-        "│  ● busy",
-        "│  ○ idle",
-        "│> ✓ up",
-        "server    ready",
-        "context   65536  server allocates 32768",
+        "│  ✗ broken".to_owned(),
+        "│  ◉ busy".to_owned(),
+        "│  ◌ idle".to_owned(),
+        "│> ✓ up".to_owned(),
+        "server    ready".to_owned(),
+        "context   65536  server allocates 32768".to_owned(),
+        format!("status    {}", status_path.display()),
     ] {
-        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        assert!(
+            screen.contains(&expected),
+            "{expected:?} missing:\n{screen}"
+        );
     }
-    launcher.ctl_json(&["select", "idle"]);
-    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    let screen = screen_of("auto");
+    assert!(
+        screen.contains("context   (Codex default)  server allocates 32768"),
+        "{screen}"
+    );
+    let screen = screen_of("even");
+    assert!(screen.contains("context   32768"), "{screen}");
+    assert!(!screen.contains("server allocates"), "{screen}");
+    let screen = screen_of("idle");
     for expected in [
         "server    starts on launch",
         "context   65536",
@@ -1230,8 +1260,43 @@ fn status_commands_report_for_wrappers_without_running_them() {
         assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
     }
     assert!(!screen.contains("server allocates"), "{screen}");
-    assert!(!launched.exists(), "a server check ran a wrapper");
     launcher.ctl_json(&["quit"]);
+
+    // With another provider, Codex would not use the server the command checks.
+    let launcher = Headless::launch(home.path(), &["--", "--oss"], bin.path(), &[]);
+    launcher.checked_state();
+    let state = launcher.ctl_json(&["select", "up"]);
+    assert_eq!(
+        state["profile"]["server"],
+        serde_json::json!({"state": "skipped", "message": "launch arguments select the profile or provider"})
+    );
+    launcher.ctl_json(&["quit"]);
+
+    let output = Command::new(BIN)
+        .args(["list", "--check", "--json"])
+        .env("CODEX_HOME", home.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let server_of = |profile: &str| {
+        let listed = listed.as_array().unwrap();
+        listed
+            .iter()
+            .find(|entry| entry["name"] == profile)
+            .unwrap()["server"]
+            .clone()
+    };
+    assert_eq!(
+        server_of("idle"),
+        serde_json::json!({"state": "starts_on_launch", "message": null, "drafting": "on"})
+    );
+    assert_eq!(
+        server_of("up"),
+        serde_json::json!({"state": "ready", "message": null, "context_window": 32768})
+    );
+    assert!(!launched.exists(), "a server check ran a wrapper");
 }
 
 #[test]

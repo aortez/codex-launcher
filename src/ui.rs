@@ -50,7 +50,7 @@ const MARKS: [(State, &str); 8] = [
     ),
     (
         State::Down,
-        "No answer, a 5xx error, refused credentials, or a status command that fails or says down.",
+        "No answer, a 5xx error, refused credentials, or a failed status command.",
     ),
     (
         State::Checking,
@@ -404,6 +404,9 @@ pub fn details(app: &App) -> Text<'static> {
     if let Some(wrapper) = &command.wrapper {
         lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
     }
+    if let Some(path) = &command.status {
+        lines.push(row("status", display_path(path, app.home()), ""));
+    }
 
     let file_name = profile
         .path
@@ -469,8 +472,9 @@ fn mark(state: Option<State>) -> Span<'static> {
     };
     let symbol = match state {
         State::Ready => "✓ ",
-        State::StartsOnLaunch => "○ ",
-        State::Busy => "● ",
+        // Neither circle has an ambiguous width, so no terminal draws one wide.
+        State::StartsOnLaunch => "◌ ",
+        State::Busy => "◉ ",
         State::Reachable => "? ",
         State::ModelMissing => "! ",
         State::Down => "✗ ",
@@ -683,8 +687,8 @@ mod tests {
             "│> default",
             "┌ Help ",
             "✓ ready             The server lists the profile's model,",
-            "○ starts on launch  The status command says launching starts the server.",
-            "● busy              The status command says the server is busy with other work.",
+            "◌ starts on launch  The status command says launching starts the server.",
+            "◉ busy              The status command says the server is busy with other work.",
             "✗ down              No answer,",
             "  not checked       The details pane's server line says why.",
             "Yellow profile names",

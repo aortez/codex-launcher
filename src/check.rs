@@ -53,7 +53,8 @@ pub enum State {
     Reachable,
     /// The server lists other models, but not this one.
     ModelMissing,
-    /// No answer, a server error, or refused credentials.
+    /// No answer, a server error, refused credentials, or a status command
+    /// that fails or says the server is down.
     Down,
     /// Not checked, for the reason in the message.
     Skipped,
@@ -182,6 +183,11 @@ impl Checks {
         let (sender, receiver) = mpsc::channel();
         self.replies = Some(receiver);
         let client = provider::client().map_err(|error| format!("{error:#}"));
+        // Arguments that select another profile or provider would make a status
+        // command report on the wrong server, so they skip it like a request.
+        let selected = crate::effort::query_arguments(args, None)
+            .err()
+            .map(|error| format!("{error:#}"));
         let mut probes: Vec<Probe> = Vec::new();
         (self.targets, self.statuses) = catalog
             .profiles
@@ -189,8 +195,11 @@ impl Checks {
             .zip(commands)
             .map(|(profile, command)| {
                 let planned = match (&command.status, &client) {
-                    // A status command's report needs no model to compare.
-                    (Some(path), _) => Ok((Probe::Status(path.clone()), String::new())),
+                    (Some(path), _) => match &selected {
+                        Some(reason) => Err(reason.clone()),
+                        // A status command's report needs no model to compare.
+                        None => Ok((Probe::Status(path.clone()), String::new())),
+                    },
                     (None, Ok(client)) => request(profile, command, &catalog.codex_home, args)
                         .map(|(url, headers, model)| (Probe::Models(client, url, headers), model)),
                     (None, Err(reason)) => Err(reason.clone()),
@@ -283,7 +292,7 @@ fn request(
     // A wrapper may start the server or load credentials before Codex runs.
     if command.wrapper.is_some() {
         return Err(format!(
-            "launched through {}, which has no {}",
+            "launched through {}, and no {} is on PATH",
             command.program,
             launch::status_name(&profile.name)
         ));
@@ -321,7 +330,8 @@ fn run_status(path: &Path, timeout: Duration) -> Status {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let down = |reason: String| Status::new(State::Down, Some(reason));
+    // A parse error may quote the command's output, so clean it up too.
+    let down = |reason: String| Status::new(State::Down, reported_text(&reason));
     let mut command = std::process::Command::new(path);
     match process::run(&mut command, Instant::now() + timeout, MAX_STATUS_BYTES) {
         Ok(Outcome::Exited(exit, bytes)) if exit.success() => parse_status(&bytes)
@@ -632,13 +642,15 @@ mod tests {
     fn status_commands_that_fail_or_hang_are_down() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let run = |name: &str, body: &str| {
+        let run_within = |name: &str, body: &str, timeout: Duration| {
             let path = dir.path().join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let status = run_status(&path, Duration::from_millis(500));
+            let status = run_status(&path, timeout);
             (status.state, status.message.unwrap_or_default())
         };
+        // Leave a slow machine time to start the shell, except for the hang.
+        let run = |name: &str, body: &str| run_within(name, body, Duration::from_secs(5));
         assert_eq!(
             run("codex-up.status", r#"printf '{"state": "ready"}'"#),
             (State::Ready, String::new())
@@ -656,8 +668,32 @@ mod tests {
             message.starts_with("codex-garbled.status printed no valid status: "),
             "{message}"
         );
+        // The parse error quotes the state, escape and all.
+        let report = format!(r#"{{"state": "\u001b[2J{}"}}"#, "x".repeat(300));
+        let (state, message) = run("codex-odd.status", &format!("printf '%s' '{report}'"));
+        assert_eq!(state, State::Down);
+        assert!(
+            message
+                .starts_with("codex-odd.status printed no valid status: unknown variant ` [2Jxxx"),
+            "{message}"
+        );
+        assert_eq!(message.chars().count(), MAX_REPORTED_CHARS);
         assert_eq!(
-            run("codex-hangs.status", "exec sleep 5"),
+            run(
+                "codex-floods.status",
+                "head -c 100000 /dev/zero\nexec sleep 5"
+            ),
+            (
+                State::Down,
+                "codex-floods.status printed too much".to_owned()
+            )
+        );
+        assert_eq!(
+            run_within(
+                "codex-hangs.status",
+                "exec sleep 5",
+                Duration::from_millis(500)
+            ),
             (
                 State::Down,
                 "codex-hangs.status did not finish within 500ms".to_owned()

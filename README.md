@@ -100,8 +100,8 @@ profile:
 | Mark | State | Meaning |
 | --- | --- | --- |
 | `✓` | ready | The server lists the profile's model, or its status command says ready. |
-| `○` | starts on launch | The status command says launching starts the server. |
-| `●` | busy | The status command says the server is busy with other work. |
+| `◌` | starts on launch | The status command says launching starts the server. |
+| `◉` | busy | The status command says the server is busy with other work. |
 | `!` | model missing | The server answered without the model. |
 | `?` | reachable | The server answered, but not with a model list. |
 | `✗` | down | No answer, an HTTP 5xx error, refused credentials, or a status command that fails or says down. |
@@ -135,10 +135,17 @@ profile or provider.
 
 ### Status commands
 
-To check a profile launched through a wrapper, put an executable named
-`codex-<name>.status` on `PATH`. The check then runs it, with no arguments or
-input, instead of asking the server for its model list. It must report without
-starting or changing anything, and print one JSON object:
+To check a profile your own way, such as one launched through a wrapper, put an
+executable named `codex-<name>.status` on `PATH`. The check then runs it
+instead of asking the server for its model list, and the details pane shows its
+path on a `status` line. The launcher looks for status commands when it starts,
+and only in absolute `PATH` entries, so a `.` entry never runs one from the
+current directory.
+
+The command runs with no arguments or input. It must report without starting or
+changing anything, and without using the terminal, which it shares with the
+menu: give `ssh` `-o BatchMode=yes`, so that it fails instead of asking for a
+password. It prints one JSON object:
 
 ```json
 {"state": "busy", "message": "another session is using the server", "context_window": 131072, "drafting": "on"}
@@ -147,10 +154,12 @@ starting or changing anything, and print one JSON object:
 `state` is `ready`, `starts_on_launch`, `busy`, or `down`, and sets the
 profile's mark. The other fields are optional:
 
-- `message` follows the state on the `server` line.
-- `context_window` is the context the server allocates, in tokens. When it
-  differs from `model_context_window`, the `context` line says so in yellow.
-- `drafting` describes the server's draft model, on a `drafting` line.
+- `message` is a string that follows the state on the `server` line.
+- `context_window` is the context the server allocates, as a whole number of
+  tokens. When it differs from `model_context_window`, the `context` line says
+  so in yellow.
+- `drafting` is a string about the server's draft model, such as `on` or the
+  draft model's name, shown on a `drafting` line.
 
 The command has ten seconds to finish, and its stderr is discarded. If it
 fails, prints anything else, or runs out of time, the profile is marked down
