@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Scroll};
 use crate::check::{State, Status};
+use crate::launch::shell_quote;
 use crate::profile::{Profile, Setting, Source};
 
 const LABEL_WIDTH: usize = 10;
@@ -400,12 +401,28 @@ pub fn details(app: &App) -> Text<'static> {
     }
     lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
     lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
-    lines.push(row("launch", command.display(), ""));
-    if let Some(wrapper) = &command.wrapper {
-        lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
+    match &command.wrapper {
+        // The launch command already names a wrapper from codex-launcher.toml.
+        Some(wrapper) if command.configured => {
+            lines.push(row(
+                "launch",
+                command_line(wrapper, &command.args, app.home()),
+                "",
+            ));
+        }
+        wrapper => {
+            lines.push(row("launch", command.display(), ""));
+            if let Some(wrapper) = wrapper {
+                lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
+            }
+        }
     }
-    if let Some(path) = &command.status {
-        lines.push(row("status", display_path(path, app.home()), ""));
+    if let Some(status) = &command.status {
+        lines.push(row(
+            "status",
+            command_line(&status.path, &status.args, app.home()),
+            "",
+        ));
     }
 
     let file_name = profile
@@ -526,6 +543,19 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
+}
+
+/// A command as a shell-quoted line, with a program in the home directory
+/// shown as `~/...`, which a shell still expands.
+fn command_line(program: &Path, args: &[String], home: Option<&Path>) -> String {
+    let program = match home.and_then(|home| program.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", shell_quote(&rest.to_string_lossy())),
+        None => shell_quote(&program.to_string_lossy()),
+    };
+    std::iter::once(program)
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Render a buffer as text, one line per row, without trailing spaces.
@@ -761,6 +791,24 @@ mod tests {
             "~/bin/x"
         );
         assert_eq!(display_path(Path::new("/opt/x"), Some(home)), "/opt/x");
+    }
+
+    #[test]
+    fn command_lines_quote_the_program_too() {
+        let home = Path::new("/home/u");
+        let args = ["work".to_owned(), "two words".to_owned()];
+        assert_eq!(
+            command_line(Path::new("/home/u/bin/run"), &args, Some(home)),
+            "~/bin/run work 'two words'"
+        );
+        assert_eq!(
+            command_line(Path::new("/home/u/my tools/run"), &args, Some(home)),
+            "~/'my tools/run' work 'two words'"
+        );
+        assert_eq!(
+            command_line(Path::new("/opt/it's/check"), &[], Some(home)),
+            r"'/opt/it'\''s/check'"
+        );
     }
 
     #[test]
