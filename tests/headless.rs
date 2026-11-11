@@ -290,12 +290,21 @@ impl Headless {
         Self::start_with_env(codex_home, args, path, &[])
     }
 
+    /// Start with server checks off, so fixture servers see only the requests
+    /// that a test makes. Press `r` to check, or use `launch` to check at once.
     fn start_with_env(
         codex_home: &Path,
         args: &[&str],
         path: &Path,
         env: &[(&str, Option<&str>)],
     ) -> Self {
+        let args: Vec<&str> = std::iter::once("--no-check")
+            .chain(args.iter().copied())
+            .collect();
+        Self::launch(codex_home, &args, path, env)
+    }
+
+    fn launch(codex_home: &Path, args: &[&str], path: &Path, env: &[(&str, Option<&str>)]) -> Self {
         let runtime = tempfile::tempdir().unwrap();
         let mut command = Command::new(BIN);
         command
@@ -350,6 +359,20 @@ impl Headless {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    /// The state once no server check is still running.
+    fn checked_state(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = self.ctl_json(&["state"]);
+            let menu = state["menu"].as_array().unwrap();
+            if !menu.iter().any(|entry| entry["server"] == "checking") {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "server checks never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for the launcher to exit and return its stdout.
     fn finish(mut self) -> String {
         let status = self.child.wait().unwrap();
@@ -380,6 +403,8 @@ fn ctl_reads_and_drives_the_menu() {
     assert_eq!(state["status"], "selecting");
     assert_eq!(state["mode"], "headless");
     assert_eq!(state["selected"], "default");
+    assert!(state["menu"][0].get("server").is_none());
+    assert!(state["profile"].get("server").is_none());
     let names: Vec<_> = state["menu"]
         .as_array()
         .unwrap()
@@ -438,6 +463,24 @@ fn bad_requests_change_nothing() {
     let state = launcher.ctl_json(&["quit"]);
     assert_eq!(state["status"], "quitting");
     assert_eq!(launcher.finish(), "");
+}
+
+#[test]
+fn help_takes_ctl_keys_until_it_closes() {
+    let launcher = Headless::start(&["--size", "80x12"]);
+    assert!(launcher.ctl_json(&["state"])["help"].is_null());
+    let state = launcher.ctl_json(&["key", "?", "end"]);
+    let max = state["help"]["max_scroll"].as_u64().unwrap();
+    assert!(max > 0, "{state}");
+    assert_eq!(state["help"]["scroll"], max);
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    assert!(screen.contains("Quit."), "{screen}");
+
+    // While the help is open, q closes it instead of quitting.
+    let state = launcher.ctl_json(&["key", "q"]);
+    assert!(state["help"].is_null(), "{state}");
+    assert_eq!(state["status"], "selecting");
+    launcher.ctl_json(&["quit"]);
 }
 
 #[test]
@@ -564,6 +607,19 @@ impl OllamaServer {
                         length = value.trim().parse().unwrap();
                     }
                     headers.push_str(&line);
+                }
+                if headers.starts_with("GET ") {
+                    tx.send((headers, Value::Null)).unwrap();
+                    let response = serde_json::json!({"object": "list", "data": [
+                        {"id": "toggle"}, {"id": "coder"}, {"id": "qwen3:30b"},
+                    ]})
+                    .to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    );
+                    continue;
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
@@ -978,4 +1034,138 @@ fn builtin_ollama_fixture_uses_base_url_or_port_without_a_provider_table() {
         assert!(header_values(&headers, "Authorization").is_empty());
         launcher.ctl_json(&["quit"]);
     }
+}
+
+#[test]
+fn server_checks_mark_profiles_and_recheck_on_demand() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = OllamaServer::start();
+    let home = server.home("toggle");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_url = format!("http://{}/v1", closed.local_addr().unwrap());
+    drop(closed);
+    for (name, text) in [
+        ("missing", "model='qwen3:30b-64k'\n".to_owned()),
+        (
+            "offline",
+            format!(
+                "model='toggle'\nmodel_provider='offline'\n[model_providers.offline]\nbase_url={closed_url:?}\n"
+            ),
+        ),
+        ("wrapped", "model='toggle'\n".to_owned()),
+    ] {
+        std::fs::write(home.path().join(format!("{name}.config.toml")), text).unwrap();
+    }
+    let bin = tempfile::tempdir().unwrap();
+    let wrapper = bin.path().join("codex-wrapped");
+    std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let launcher = Headless::launch(home.path(), &[], bin.path(), &[]);
+    let state = launcher.checked_state();
+    let servers: Vec<_> = state["menu"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap(),
+                entry["server"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        servers,
+        [
+            ("default", "ready"),
+            ("missing", "model_missing"),
+            ("offline", "down"),
+            ("wrapped", "skipped"),
+        ]
+    );
+    assert_eq!(
+        state["profile"]["server"],
+        serde_json::json!({"state": "ready", "message": null})
+    );
+    let state = launcher.ctl_json(&["select", "missing"]);
+    assert_eq!(
+        state["profile"]["server"]["message"],
+        "the server has qwen3:30b"
+    );
+    let state = launcher.ctl_json(&["select", "wrapped"]);
+    assert_eq!(
+        state["profile"]["server"]["message"],
+        "launched through codex-wrapped"
+    );
+    launcher.ctl_json(&["select", "offline"]);
+    let screen = String::from_utf8(launcher.ctl(&["screen"]).stdout).unwrap();
+    for expected in [
+        "│  ✓ default",
+        "│  ! missing",
+        "│> ✗ offline",
+        "│    wrapped",
+        "server    down: connection refused",
+        "r recheck",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+
+    // Profiles that share a server and headers share one request.
+    let (headers, _) = server
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        headers.starts_with("GET /proxy/v1/models HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(headers.contains("x-test: header-secret"), "{headers}");
+    assert!(server.requests.try_recv().is_err());
+
+    // Checking again reads the profile files again.
+    std::fs::write(home.path().join("offline.config.toml"), "model='coder'\n").unwrap();
+    launcher.ctl_json(&["key", "r"]);
+    let state = launcher.checked_state();
+    assert_eq!(state["menu"][2]["server"], "ready");
+    assert_eq!(server.requests.try_iter().count(), 1);
+    launcher.ctl_json(&["quit"]);
+}
+
+#[test]
+fn list_check_adds_server_states() {
+    let server = OllamaServer::start();
+    let home = server.home("toggle");
+    std::fs::write(home.path().join("other.config.toml"), "model='absent'\n").unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new(BIN)
+            .args(args)
+            .env("CODEX_HOME", home.path())
+            .env("PATH", "/nonexistent")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let listing = run(&["list", "--check"]);
+    let lines: Vec<_> = listing.lines().collect();
+    assert!(
+        lines[0].contains(" EFFORT  SERVER         DESCRIPTION"),
+        "{listing}"
+    );
+    assert!(
+        lines[1].contains(" high    ready          Runs Codex"),
+        "{listing}"
+    );
+    assert!(lines[2].contains(" high    model missing"), "{listing}");
+
+    let listed: Value = serde_json::from_str(&run(&["list", "--check", "--json"])).unwrap();
+    assert_eq!(listed[1]["server"]["state"], "model_missing");
+    assert_eq!(
+        listed[1]["server"]["message"],
+        "the server has toggle, coder, qwen3:30b"
+    );
+    let unchecked: Value = serde_json::from_str(&run(&["list", "--json"])).unwrap();
+    assert!(unchecked[1].get("server").is_none());
+    assert!(!run(&["list"]).contains("SERVER"));
+    assert_eq!(server.requests.try_iter().count(), 2);
 }

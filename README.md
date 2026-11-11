@@ -5,7 +5,7 @@ profile and launching Codex with it. You can also list, inspect, and launch
 profiles from the command line, and another program can read and drive a
 running menu through `codex-launcher ctl`.
 
-![codex-launcher showing sample profiles, inherited effort, and redacted configuration](docs/images/launcher.png)
+![codex-launcher showing sample profiles with server checks, inherited effort, and redacted configuration](docs/images/launcher.png)
 
 *The menu running with the repository’s sample profiles.*
 
@@ -64,6 +64,7 @@ codex-launcher local                   # Launch a profile without the menu.
 codex-launcher local exec "fix tests"  # Arguments after the profile go to Codex.
 codex-launcher local --dry-run         # Print the command instead of running it.
 codex-launcher list                    # One line per profile; --json for JSON.
+codex-launcher list --check            # Add whether each profile's server is ready.
 codex-launcher show gateway            # The details pane as text; --json for JSON.
 ```
 
@@ -79,9 +80,49 @@ local    qwen3-coder:30b  ollama    medium  Local Ollama model on this machine.
 can only be launched from the menu.
 
 In the menu, `↑`/`↓` (or `k`/`j`) move, `Home`/`End` (or `g`/`G`) jump to the
-first or last profile, `PgUp`/`PgDn` scroll the details, `Enter` launches, and
-`q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher process with
-Codex, so Codex gets the terminal and nothing is left running.
+first or last profile, `PgUp`/`PgDn` scroll the details, `r` checks the model
+servers again, `?` shows what the keys and the server marks mean, `Enter`
+launches, and `q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher
+process with Codex, so Codex gets the terminal and nothing is left running.
+
+### Server checks
+
+A profile works only if its model server is running and has the model. When the
+menu opens, it asks each profile's server for its model list in the background
+and marks the profile:
+
+| Mark | State | Meaning |
+| --- | --- | --- |
+| `✓` | ready | The server lists the profile's model. |
+| `!` | model missing | The server answered without the model. |
+| `?` | reachable | The server answered, but not with a model list. |
+| `✗` | down | No answer, an HTTP 5xx error, or refused credentials. |
+| `…` | checking | The server has not answered yet. |
+
+Press `?` in the menu to see these marks explained beside the list:
+
+![The help screen beside the profile list, explaining the server marks and the keys](docs/images/help.png)
+
+The `server` line in the details pane gives the reason, such as
+`down: connection refused` or `model missing: the server has qwen3-coder:30b`.
+After starting a server or an SSH tunnel, press `r` to check again.
+`codex-launcher --no-check` opens the menu without contacting servers; `r`
+still checks on demand.
+
+The check is `GET <base_url>/models`, which Ollama, vLLM, llama.cpp, and most
+OpenAI-compatible gateways answer without loading a model, so a listed model can
+still fail to load. Profiles that share a server and headers share one request,
+and each request has three seconds to finish. The request uses the same
+provider settings as the Ollama lookup under [Changing effort](#changing-effort):
+the base URL, `query_params`, headers, and credentials, with redirects refused.
+The base URL need not end in `/v1`. A model name without a tag also matches
+Ollama's `<name>:latest`.
+
+Profiles without a mark are not checked, and their `server` line says why. This
+covers profiles launched through a wrapper, which may start the server or load
+credentials first; built-in providers other than `ollama`, such as `openai`;
+providers with `requires_openai_auth`; providers whose `env_key` variable is
+unset; and launch arguments that select a profile or provider.
 
 ### Changing effort
 
@@ -203,6 +244,20 @@ the open picker's selected index, where zero means inheritance, or null when clo
 contains save feedback or a keyboard-action error, when present. Invalid
 `ctl effort` values fail without changing the current choice.
 
+`profile.server` reports the selected profile's server check: its `state`
+(`checking`, `ready`, `model_missing`, `reachable`, `down`, or `skipped`) and a
+`message` with the reason, or null. Each `menu` entry has its `server` state.
+`ctl key r` checks again; read `ctl state` until no entry is `checking`. With
+`--no-check`, these fields are absent until the first check.
+`list --check --json` adds the same `server` object to each profile.
+
+`help` is null unless the help screen is open, from the keyboard or from
+`ctl key '?'` (quote the `?` so the shell does not expand it); then it reports
+the help's `scroll` and `max_scroll`. While the help or the effort picker is
+open, keys go to it instead of the menu: `r` does not check the servers, and
+`Esc` or `q` closes it rather than quitting. Read `help` and `effort_picker`
+before sending menu keys.
+
 ```
 $ codex-launcher ctl key down
 {
@@ -217,9 +272,9 @@ $ codex-launcher ctl key down
   "command": ["codex", "--profile", "gateway"],
   "command_line": "codex --profile gateway",
   "menu": [
-    {"name": "default", "model": "gpt-base", "provider": "openai", "effort": "high"},
-    {"name": "gateway", "model": "gpt-team", "provider": "gateway", "effort": "high"},
-    {"name": "local", "model": "qwen3-coder:30b", "provider": "ollama", "effort": "medium"}
+    {"name": "default", "model": "gpt-base", "provider": "openai", "effort": "high", "server": "skipped"},
+    {"name": "gateway", "model": "gpt-team", "provider": "gateway", "effort": "high", "server": "ready"},
+    {"name": "local", "model": "qwen3-coder:30b", "provider": "ollama", "effort": "medium", "server": "down"}
   ],
   "profile": {"name": "gateway", "model": {"value": "gpt-team", "source": "profile"}, ...},
   "details": {"scroll": 0, "max_scroll": 0},
