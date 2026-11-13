@@ -34,6 +34,8 @@ impl Program {
 /// The command that launching a profile runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
+    /// Whether this program owns its arguments instead of accepting Codex flags.
+    pub custom_harness: bool,
     /// The program name shown to the user.
     pub program: String,
     pub args: Vec<String>,
@@ -58,6 +60,9 @@ impl Command {
     /// arguments stay first and unchanged.
     pub fn with_effort(&self, effort: &str) -> Self {
         let mut command = self.clone();
+        if self.custom_harness {
+            return command;
+        }
         let (own, codex) = self.args.split_at(self.wrapper_arg_count);
         command.args = own.to_vec();
         command.args.extend([
@@ -89,9 +94,21 @@ impl Command {
     /// `codex --profile NAME` when that executable is on `path`. Either
     /// wrapper is expected to select the profile itself.
     pub fn for_profile(profile: &Profile, extra: &[String], path: Option<&OsStr>) -> Self {
-        let mut command = match &profile.wrapper {
-            Some(configured) => Self::configured(profile, configured),
-            None => Self::found(profile, path),
+        let mut command = if let Some(harness) = &profile.harness {
+            Self {
+                custom_harness: true,
+                program: harness.launch.path.to_string_lossy().into_owned(),
+                args: harness.launch.args.clone(),
+                wrapper_arg_count: harness.launch.args.len(),
+                configured: true,
+                wrapper: Some(harness.launch.path.clone()),
+                status: harness.status.clone(),
+            }
+        } else {
+            match &profile.wrapper {
+                Some(configured) => Self::configured(profile, configured),
+                None => Self::found(profile, path),
+            }
         };
         command.args.extend(extra.iter().cloned());
         command
@@ -100,6 +117,7 @@ impl Command {
     /// `codex --profile NAME`, or `codex` alone for the default entry.
     fn plain(profile: &Profile) -> Self {
         Self {
+            custom_harness: false,
             program: CODEX.to_owned(),
             args: if profile.is_default() {
                 Vec::new()
@@ -118,6 +136,7 @@ impl Command {
         let status = configured.status.clone();
         match &configured.launch {
             Some(launch) => Self {
+                custom_harness: false,
                 program: launch.path.to_string_lossy().into_owned(),
                 args: launch.args.clone(),
                 wrapper_arg_count: launch.args.len(),
@@ -144,6 +163,7 @@ impl Command {
         });
         match find_wrapper(&profile.name, path) {
             Some(wrapper) => Self {
+                custom_harness: false,
                 program: wrapper_name(&profile.name),
                 args: Vec::new(),
                 wrapper_arg_count: 0,

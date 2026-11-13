@@ -93,9 +93,11 @@ pub struct Provider {
     pub missing: bool,
 }
 
-/// One menu entry: either the base configuration or a profile layer.
+/// One menu entry: the Codex base configuration, a profile layer, or a harness.
 #[derive(Clone, Debug)]
 pub struct Profile {
+    /// An independent program, with no Codex configuration inheritance.
+    pub harness: Option<crate::harness::Harness>,
     pub name: String,
     /// The profile file, or config.toml for the default entry.
     pub path: PathBuf,
@@ -234,6 +236,13 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         profile.wrapper = wrappers.remove(&profile.name);
         profiles.push(profile);
     }
+    profiles.extend(crate::harness::load(
+        codex_home,
+        &profiles,
+        home_dir().as_deref(),
+        &mut warnings,
+    ));
+    profiles[1..].sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Catalog {
         codex_home: codex_home.to_path_buf(),
@@ -249,6 +258,9 @@ pub fn save_effort(profile: &Profile, effort: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    if profile.harness.is_some() {
+        bail!("effort is configured by this harness preset");
+    }
     let path = &profile.path;
     let metadata = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
@@ -402,6 +414,7 @@ fn build_profile(
         None
     };
     Profile {
+        harness: None,
         name,
         path,
         description,
@@ -522,6 +535,13 @@ fn redacted_text(file: &ConfigFile) -> Option<String> {
         )),
         (None, None) => None,
     }
+}
+
+/// Show only this launcher entry, applying the normal configuration redaction.
+pub(crate) fn redacted_entry(table: &Table) -> String {
+    let mut table = table.clone();
+    redact_table(&mut table, false);
+    redact_comment_lines(&table.to_string())
 }
 
 /// Whether a key name looks like it holds a credential.

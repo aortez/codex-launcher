@@ -70,7 +70,7 @@ fn parse(
 ) -> BTreeMap<String, Wrapper> {
     let mut wrappers = BTreeMap::new();
     for (key, _) in document.iter() {
-        if key != "wrapper" {
+        if key != "wrapper" && key != "harness" {
             warnings.push(format!("{FILE_NAME}: unknown key {key:?}"));
         }
     }
@@ -132,6 +132,16 @@ fn parse(
         }
     }
     wrappers
+}
+
+/// Parse an exact argv with the same path and placeholder rules as wrappers.
+pub(crate) fn command(
+    entry: &Table,
+    key: &str,
+    name: &str,
+    home: Option<&Path>,
+) -> Result<Option<Program>, String> {
+    template(entry, key, home).map(|value| value.map(|template| template.fill(name)))
 }
 
 /// A list of strings, or `None` for anything else.

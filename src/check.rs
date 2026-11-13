@@ -220,6 +220,12 @@ impl Checks {
             .zip(commands)
             .map(|(profile, command)| {
                 let planned = match (&command.status, &client) {
+                    (Some(status), _) if profile.harness.is_some() => {
+                        Ok((Probe::Status(status.clone()), profile.name.clone()))
+                    }
+                    (None, _) if profile.harness.is_some() => {
+                        Err("no status command configured for this harness".to_owned())
+                    }
                     (Some(status), _) => match &selected {
                         Some(reason) => Err(reason.clone()),
                         // A shared command may return a report for each profile.

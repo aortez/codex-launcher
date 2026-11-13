@@ -1,7 +1,7 @@
 # codex-launcher
 
 A terminal menu for choosing a [Codex CLI](https://github.com/openai/codex)
-profile and launching Codex with it. You can also list, inspect, and launch
+profile or a custom harness and launching it. You can also list, inspect, and launch
 profiles from the command line, and another program can read and drive a
 running menu through `codex-launcher ctl`.
 
@@ -84,6 +84,41 @@ leaves those out. A profile whose commands are left out still ignores `PATH`.
 
 ![The details pane for lab, which one script launches and checks for both lab profiles](docs/images/wrappers.png)
 
+### Custom harnesses
+
+To launch an independent chat or coding harness, add a `[[harness]]` entry to
+`$CODEX_HOME/codex-launcher.toml`. It appears in the same menu without a
+`<name>.config.toml` file:
+
+```toml
+[[harness]]
+name = "playtime-framework-fast"
+harness = "Playtime"
+description = "Project chat on Framework with Gyro-M fast."
+launch = ["~/.local/lib/playtime-chat/run-strata.py", "framework-gyro-m-fast"]
+status = ["~/.local/lib/playtime-chat/run-strata.py", "--status", "framework-gyro-m-fast"]
+model = "qwen3.8-flash-next-gyro-gyro-m"
+provider = "Strata on Framework"
+context_window = 163840
+effort = "medium"
+tools = "project Docker; no external network"
+```
+
+`name`, `harness` and `launch` are required. Names use the same letters, digits,
+hyphens and underscores as profiles and must be unique across both kinds of
+entry; `default` is reserved. Commands use absolute or `~/` program paths and
+the wrapper syntax above, including `{profile}`. A malformed entry is skipped
+with a warning; it never falls back to Codex. `status` is optional and must be
+read-only. Without it, server checks are skipped for that entry.
+
+Launching preserves the current directory and passes additional arguments
+unchanged to the configured program. The program owns model startup, tools,
+sessions and cleanup. The launcher does not inherit `config.toml`, look up Codex
+or Ollama model capabilities, or add Codex arguments. The optional model,
+provider, context, effort and tools fields describe the preset; they do not
+configure the harness. The effort picker shows the preset and cannot change or
+save it. Existing Codex profiles retain their normal effort controls.
+
 ## Usage
 
 ```sh
@@ -112,7 +147,7 @@ In the menu, `↑`/`↓` (or `k`/`j`) move, `Home`/`End` (or `g`/`G`) jump to th
 first or last profile, `PgUp`/`PgDn` scroll the details, `r` checks the model
 servers again, `?` shows what the keys and the server marks mean, `Enter`
 launches, and `q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher
-process with Codex, so Codex gets the terminal and nothing is left running.
+process with the selected program, which gets the terminal.
 
 ### Server checks
 
@@ -233,6 +268,9 @@ fi
 ```
 
 ### Changing effort
+
+These controls apply to Codex profiles. Custom harness entries display their
+preset effort without Codex discovery, overrides or configuration writes.
 
 Press `e` to open the effort picker for the selected profile. Use `↑`/`↓`
 (or `k`/`j`) to choose a level, then `Enter` to apply it for this launch.

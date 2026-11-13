@@ -1,9 +1,10 @@
-//! codex-launcher: pick a Codex CLI profile, then launch Codex with it.
+//! codex-launcher: select a Codex profile or an independent harness.
 
 mod app;
 mod check;
 mod control;
 mod effort;
+mod harness;
 mod launch;
 mod ollama;
 mod process;
@@ -29,7 +30,7 @@ use crate::control::Request;
 use crate::launch::Command;
 use crate::profile::Catalog;
 
-const ABOUT: &str = "Pick a Codex CLI profile from a menu or by name, then launch Codex with it.";
+const ABOUT: &str = "Pick a Codex profile or custom harness from a menu or by name.";
 
 const AFTER_HELP: &str = "\
 Profiles are $CODEX_HOME/<name>.config.toml files (CODEX_HOME defaults to
@@ -39,6 +40,8 @@ named codex-<name> is on PATH, launching <name> runs it instead of
 checks never run a wrapper, but run codex-<name>.status when it is on PATH.
 A profile named in $CODEX_HOME/codex-launcher.toml ignores both, and uses the
 launch and status commands that the file gives it; see the README.
+Standalone [[harness]] entries in that file run their own programs without
+Codex configuration inheritance or generated Codex arguments.
 
 In the menu, press ? to see what the keys and the server marks mean.
 
@@ -65,7 +68,7 @@ struct Cli {
     #[arg(value_name = "PROFILE")]
     profile: Option<String>,
 
-    /// Arguments passed to Codex. Put them after `--` when there is no profile.
+    /// Arguments passed to the selected program. Use `--` with no profile.
     #[arg(
         value_name = "CODEX_ARGS",
         trailing_var_arg = true,
@@ -89,7 +92,7 @@ struct Cli {
     )]
     size: (u16, u16),
 
-    /// Print the Codex command instead of running it.
+    /// Print the selected command instead of running it.
     #[arg(long, requires = "profile")]
     dry_run: bool,
 
@@ -262,11 +265,11 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
         if cli.headless {
             bail!("--headless opens the menu; leave out the profile name");
         }
+        // Show malformed custom entries before reporting a missing name.
+        print_warnings(&catalog);
         let profile = catalog
             .find(name)
             .ok_or_else(|| anyhow::anyhow!(unknown_profile(&catalog, name)))?;
-        // A problem in codex-launcher.toml can change what runs.
-        print_warnings(&catalog);
         let command = Command::for_profile(profile, &cli.codex_args, path.as_deref());
         if cli.dry_run {
             println!("{}", command.display());

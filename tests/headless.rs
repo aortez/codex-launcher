@@ -23,6 +23,92 @@ fn writable_home() -> tempfile::TempDir {
 }
 
 #[test]
+fn custom_harness_uses_own_commands_status_and_effort_policy() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = writable_home();
+    let bin = tempfile::tempdir().unwrap();
+    let run = bin.path().join("chat");
+    std::fs::write(&run, "#!/bin/sh\nif [ \"$1\" = --status ]; then\n  printf '%s' '{\"state\":\"starts_on_launch\",\"context_window\":32768}'\nelse\n  pwd\n  printf '%s\\n' \"$@\"\nfi\n").unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\nprintf 'unexpected' > \"$0.called\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        "[[harness]]\nname='chat'\nharness='Playtime'\nmodel='local-model'\neffort='medium'\ntools='project Docker; no network'\nlaunch=['{}', 'fixed argument']\nstatus=['{}', '--status']\n",
+        run.display(),
+        run.display()
+    );
+    std::fs::write(home.path().join("codex-launcher.toml"), &config).unwrap();
+    let menu = Headless::start_with_path(home.path(), &["--", "--prompt", "hello"], bin.path());
+    let state = menu.ctl_json(&["select", "chat"]);
+    assert_eq!(state["profile"]["harness"], "Playtime");
+    let screen = String::from_utf8(menu.ctl(&["screen"]).stdout).unwrap();
+    assert!(screen.contains("harness   Playtime"), "{screen}");
+    assert!(
+        screen.contains("tools     project Docker; no network"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Codex default") && !screen.contains("sandbox   "),
+        "{screen}"
+    );
+    let state = menu.ctl_json(&["key", "e"]);
+    assert_eq!(state["effort_choices"]["metadata_source"], "harness preset");
+    assert_eq!(state["effort_choices"]["levels"], serde_json::json!([]));
+    assert!(!menu.ctl(&["effort", "high"]).status.success());
+    assert!(!menu.ctl(&["save-effort"]).status.success());
+    menu.ctl_json(&["key", "esc"]);
+    let state = menu.ctl_json(&["launch"]);
+    assert_eq!(
+        state["profile"]["command"],
+        serde_json::json!([run.to_str().unwrap(), "fixed argument", "--prompt", "hello"])
+    );
+    assert!(!codex.with_extension("called").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("codex-launcher.toml")).unwrap(),
+        config
+    );
+
+    let output = Command::new(BIN)
+        .args(["list", "--check", "--json"])
+        .env("CODEX_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let shown = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "chat")
+        .unwrap();
+    assert_eq!(shown["server"]["state"], "starts_on_launch");
+    assert!(shown["sandbox"].is_null() && shown["approval"].is_null());
+    let output = Command::new(BIN)
+        .args(["chat", "--prompt", "literal ; $(stuff)"])
+        .env("CODEX_HOME", home.path())
+        .current_dir(bin.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}\nfixed argument\n--prompt\nliteral ; $(stuff)\n",
+            bin.path().display()
+        )
+    );
+}
+
+#[test]
 fn codex_catalog_takes_precedence_and_is_queried_once_per_profile() {
     use std::os::unix::fs::PermissionsExt;
     let home = writable_home();
