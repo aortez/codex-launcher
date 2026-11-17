@@ -474,12 +474,15 @@ fn source_tag(profile: &Profile, source: Source) -> &'static str {
 
 fn setting_line(profile: &Profile, label: &str, setting: Option<&Setting>) -> Line<'static> {
     match setting {
+        Some(setting) if profile.harness.is_some() => row(label, setting.value.clone(), "(preset)"),
         Some(setting) => row(
             label,
             setting.value.clone(),
             source_tag(profile, setting.source),
         ),
-        None if profile.harness.is_some() => row(label, "(harness default)".to_owned(), ""),
+        // A harness program picks these itself, so the launcher has no value
+        // to report and no Codex default to name.
+        None if profile.harness.is_some() => row(label, "(set by harness)".to_owned(), ""),
         None => row(label, "(Codex default)".to_owned(), ""),
     }
 }

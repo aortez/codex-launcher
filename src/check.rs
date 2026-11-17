@@ -220,6 +220,10 @@ impl Checks {
             .zip(commands)
             .map(|(profile, command)| {
                 let planned = match (&command.status, &client) {
+                    // A harness names its own status command, and launch
+                    // arguments go to the harness program rather than to
+                    // Codex, so they cannot retarget this check and do not
+                    // skip it the way they skip a profile's.
                     (Some(status), _) if profile.harness.is_some() => {
                         Ok((Probe::Status(status.clone()), profile.name.clone()))
                     }

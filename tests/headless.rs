@@ -37,8 +37,11 @@ fn custom_harness_uses_own_commands_status_and_effort_policy() {
     )
     .unwrap();
     std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // `bare` leaves the descriptive fields out, so its details show what the
+    // launcher cannot know rather than a Codex default it never consulted.
     let config = format!(
-        "[[harness]]\nname='chat'\nharness='Playtime'\nmodel='local-model'\neffort='medium'\ntools='project Docker; no network'\nlaunch=['{}', 'fixed argument']\nstatus=['{}', '--status']\n",
+        "[[harness]]\nname='chat'\nharness='Playtime'\nmodel='local-model'\neffort='medium'\ntools='project Docker; no network'\nlaunch=['{}', 'fixed argument']\nstatus=['{}', '--status']\n[[harness]]\nname='bare'\nharness='Playtime'\nlaunch=['{}']\n",
+        run.display(),
         run.display(),
         run.display()
     );
@@ -52,9 +55,28 @@ fn custom_harness_uses_own_commands_status_and_effort_policy() {
         screen.contains("tools     project Docker; no network"),
         "{screen}"
     );
+    // The preset tag says these describe the entry instead of Codex settings
+    // that the launcher inherits or could override.
+    for expected in [
+        "model     local-model  (preset)",
+        "effort    medium  (preset)",
+    ] {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
     assert!(
         !screen.contains("Codex default") && !screen.contains("sandbox   "),
         "{screen}"
+    );
+    let shown = Command::new(BIN)
+        .args(["show", "bare"])
+        .env("CODEX_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let bare = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        bare.contains("model     (set by harness)") && bare.contains("effort    (set by harness)"),
+        "{bare}"
     );
     let state = menu.ctl_json(&["key", "e"]);
     assert_eq!(state["effort_choices"]["metadata_source"], "harness preset");

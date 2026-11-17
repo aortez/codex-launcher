@@ -265,7 +265,9 @@ fn menu_or_launch(cli: Cli) -> Result<ExitCode> {
         if cli.headless {
             bail!("--headless opens the menu; leave out the profile name");
         }
-        // Show malformed custom entries before reporting a missing name.
+        // A problem in codex-launcher.toml can change what runs, and an entry
+        // skipped there is often why a name fails to resolve, so report the
+        // warnings before either the lookup or the exec.
         print_warnings(&catalog);
         let profile = catalog
             .find(name)
