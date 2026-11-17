@@ -3,6 +3,7 @@
 //! Codex treats `$CODEX_HOME/<name>.config.toml` as a profile layer that is
 //! merged table by table on top of `$CODEX_HOME/config.toml`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -218,7 +219,25 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         names.push(name.to_owned());
     }
     names.sort();
-    let mut wrappers = wrappers::load(codex_home, &names, home_dir().as_deref(), &mut warnings);
+    // Wrappers and harnesses share one file, so it is read and parsed once and
+    // both parsers see the same contents.
+    let launcher_path = codex_home.join(wrappers::FILE_NAME);
+    let launcher = read_config(&launcher_path);
+    if let Some(error) = &launcher.error {
+        warnings.push(format!("{}: {error}", wrappers::FILE_NAME));
+    }
+    let launcher = launcher.document.as_ref();
+    let home = home_dir();
+    let home = home.as_deref();
+    // Harness entries are parsed after the profiles, because an entry cannot
+    // reuse a profile name, but their names are needed now so that a wrapper
+    // naming one is described correctly rather than called a missing profile.
+    let harnesses = launcher.map_or_else(Vec::new, |document| {
+        crate::harness::claimed_names(document, &names)
+    });
+    let mut wrappers = launcher.map_or_else(BTreeMap::new, |document| {
+        wrappers::parse(document, &names, &harnesses, home, &mut warnings)
+    });
 
     let mut profiles = Vec::with_capacity(names.len() + 1);
     profiles.push(build_profile(
@@ -236,12 +255,15 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         profile.wrapper = wrappers.remove(&profile.name);
         profiles.push(profile);
     }
-    profiles.extend(crate::harness::load(
-        codex_home,
-        &profiles,
-        home_dir().as_deref(),
-        &mut warnings,
-    ));
+    if let Some(document) = launcher {
+        profiles.extend(crate::harness::parse(
+            &launcher_path,
+            document,
+            &profiles,
+            home,
+            &mut warnings,
+        ));
+    }
     profiles[1..].sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Catalog {
@@ -769,6 +791,84 @@ approval_policy = "on-request"
 name = "Lab server"
 base_url = "http://lab.example:11434/v1"
 "#;
+
+    #[test]
+    fn the_launcher_file_serves_wrappers_and_harnesses_alike() {
+        let home = home_with(&[
+            ("config.toml", BASE),
+            (
+                "codex-launcher.toml",
+                r#"
+[[harness]]
+name = "bird"
+harness = "Playtime"
+launch = ["/bin/chat", "{profile}"]
+
+[[wrapper]]
+profiles = ["bird"]
+launch = ["/bin/run", "{profile}"]
+"#,
+            ),
+        ]);
+        let catalog = load(home.path()).unwrap();
+        assert_eq!(
+            catalog.warnings,
+            [
+                r#"codex-launcher.toml: wrapper 1: "bird" is a harness, which launches its own program"#
+            ]
+        );
+        let bird = catalog.find("bird").unwrap();
+        assert!(bird.harness.is_some());
+        // A harness brings its own commands, so the wrapper is dropped rather
+        // than quietly deciding how the entry launches.
+        assert!(bird.wrapper.is_none());
+    }
+
+    #[test]
+    fn a_harness_reusing_a_profile_name_leaves_it_the_wrapper() {
+        let home = home_with(&[
+            ("config.toml", BASE),
+            ("work.config.toml", "model = 'work-model'\n"),
+            (
+                "codex-launcher.toml",
+                r#"
+[[harness]]
+name = "work"
+harness = "Playtime"
+launch = ["/bin/chat"]
+
+[[wrapper]]
+profiles = ["work"]
+launch = ["/bin/run", "{profile}"]
+"#,
+            ),
+        ]);
+        let catalog = load(home.path()).unwrap();
+        assert_eq!(
+            catalog.warnings,
+            [r#"codex-launcher.toml: harness 1: name "work" is already used; entry skipped"#]
+        );
+        let work = catalog.find("work").unwrap();
+        assert!(work.harness.is_none());
+        assert!(work.wrapper.is_some());
+    }
+
+    #[test]
+    fn a_broken_launcher_file_warns_once_and_loads_nothing() {
+        let home = home_with(&[
+            ("config.toml", BASE),
+            ("codex-launcher.toml", "[[wrapper]\n"),
+        ]);
+        let catalog = load(home.path()).unwrap();
+        assert_eq!(catalog.warnings.len(), 1, "{:?}", catalog.warnings);
+        assert!(
+            catalog.warnings[0].starts_with("codex-launcher.toml: invalid TOML: "),
+            "{:?}",
+            catalog.warnings
+        );
+        let home = home_with(&[("config.toml", BASE)]);
+        assert!(load(home.path()).unwrap().warnings.is_empty());
+    }
 
     #[test]
     fn valid_names_match_codex() {

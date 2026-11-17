@@ -81,6 +81,8 @@ names ignores `codex-<name>` and `codex-<name>.status` on `PATH`.
 The launcher reads the file when it starts. It warns about names that are not
 profiles, `default`, profiles named twice, and commands it cannot use, and
 leaves those out. A profile whose commands are left out still ignores `PATH`.
+A name that belongs to a [harness](#custom-harnesses) entry is reported as one
+and takes no wrapper, because the entry already launches its own program.
 
 ![The details pane for lab, which one script launches and checks for both lab profiles](docs/images/wrappers.png)
 
