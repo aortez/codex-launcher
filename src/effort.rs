@@ -47,6 +47,10 @@ impl Choices {
         codex: Option<&Path>,
         timeout: Duration,
     ) -> bool {
+        if profile.harness.is_some() {
+            *self = Self::preset();
+            return true;
+        }
         let deadline = Instant::now() + timeout;
         if let Some(codex) = codex {
             match query_catalog(profile, codex_home, args, codex, timeout) {
@@ -77,6 +81,9 @@ impl Choices {
     }
 
     pub fn load(profile: &Profile, codex_home: &Path, args: &[String]) -> Self {
+        if profile.harness.is_some() {
+            return Self::preset();
+        }
         // Command-line model/provider overrides can select a different model;
         // do not trust profile metadata in that case.
         let changed_model = args.iter().enumerate().any(|(i, arg)| {
@@ -141,6 +148,14 @@ impl Choices {
             }
         } else {
             level.to_owned()
+        }
+    }
+
+    fn preset() -> Self {
+        Self {
+            levels: Vec::new(),
+            metadata_source: Some("harness preset"),
+            control: Control::Unsupported,
         }
     }
 }

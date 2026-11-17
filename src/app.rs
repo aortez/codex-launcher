@@ -326,6 +326,9 @@ impl App {
     }
 
     fn effort_at(&self, index: usize) -> Option<&Setting> {
+        if self.catalog.profiles[index].harness.is_some() {
+            return self.catalog.profiles[index].effort.as_ref();
+        }
         self.effort_overrides[index]
             .as_ref()
             .or(self.argument_effort.as_ref())
@@ -416,6 +419,13 @@ impl App {
     }
 
     pub fn inherit_label(&self) -> String {
+        if self.selected_profile().harness.is_some() {
+            return format!(
+                "Use harness preset ({})",
+                self.effective_effort()
+                    .map_or("unspecified", |s| s.value.as_str())
+            );
+        }
         let setting = self
             .argument_effort
             .as_ref()
@@ -758,6 +768,8 @@ pub struct StateView<'a> {
 #[derive(Serialize)]
 pub struct MenuEntry<'a> {
     pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<&'a str>,
     pub model: Option<&'a str>,
     pub provider: &'a str,
     pub effort: Option<&'a str>,
@@ -770,6 +782,7 @@ impl<'a> MenuEntry<'a> {
     pub fn new(profile: &'a Profile) -> Self {
         Self {
             name: &profile.name,
+            harness: profile.harness.as_ref().map(|h| h.label.as_str()),
             model: profile.model_name(),
             provider: &profile.provider.id,
             effort: profile
@@ -785,6 +798,10 @@ impl<'a> MenuEntry<'a> {
 #[derive(Serialize)]
 pub struct ProfileView<'a> {
     pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<&'a str>,
     pub path: String,
     pub description: Option<&'a str>,
     pub model: Option<&'a Setting>,
@@ -813,6 +830,8 @@ impl<'a> ProfileView<'a> {
     pub fn new(profile: &'a Profile, command: &Command, with_file: bool) -> Self {
         Self {
             name: &profile.name,
+            harness: profile.harness.as_ref().map(|h| h.label.as_str()),
+            tools: profile.harness.as_ref().and_then(|h| h.tools.as_deref()),
             path: profile.path.display().to_string(),
             description: profile.description.as_deref(),
             model: profile.model.as_ref(),

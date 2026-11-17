@@ -199,6 +199,9 @@ fn draw_effort_picker(frame: &mut Frame, app: &App, body: Rect) {
     ])
     .areas(inner);
     let message = match choices.control {
+        crate::effort::Control::Unsupported if app.selected_profile().harness.is_some() => {
+            "Effort is configured by this harness preset.".to_owned()
+        }
         crate::effort::Control::Unsupported => {
             "No effort controls available for this model.".to_owned()
         }
@@ -367,6 +370,9 @@ pub fn details(app: &App) -> Text<'static> {
         lines.push(Line::default());
     }
 
+    if let Some(harness) = &profile.harness {
+        lines.push(row("harness", harness.label.clone(), ""));
+    }
     lines.push(setting_line(profile, "model", profile.model.as_ref()));
     lines.push(provider_line(profile));
     if let Some(url) = &profile.provider.base_url {
@@ -403,8 +409,14 @@ pub fn details(app: &App) -> Text<'static> {
     if let Some(drafting) = server.and_then(|status| status.drafting.clone()) {
         lines.push(row("drafting", drafting, ""));
     }
-    lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
-    lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
+    if let Some(harness) = &profile.harness {
+        if let Some(tools) = &harness.tools {
+            lines.push(row("tools", tools.clone(), ""));
+        }
+    } else {
+        lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
+        lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
+    }
     match &command.wrapper {
         // The launch command already names a wrapper from codex-launcher.toml.
         Some(wrapper) if command.configured => {
@@ -462,11 +474,15 @@ fn source_tag(profile: &Profile, source: Source) -> &'static str {
 
 fn setting_line(profile: &Profile, label: &str, setting: Option<&Setting>) -> Line<'static> {
     match setting {
+        Some(setting) if profile.harness.is_some() => row(label, setting.value.clone(), "(preset)"),
         Some(setting) => row(
             label,
             setting.value.clone(),
             source_tag(profile, setting.source),
         ),
+        // A harness program picks these itself, so the launcher has no value
+        // to report and no Codex default to name.
+        None if profile.harness.is_some() => row(label, "(set by harness)".to_owned(), ""),
         None => row(label, "(Codex default)".to_owned(), ""),
     }
 }

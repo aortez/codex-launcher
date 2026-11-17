@@ -1,4 +1,5 @@
-//! Building and running the Codex command for a profile.
+//! Building and running the command that launching an entry selects: Codex
+//! with a profile, a wrapper, or a harness's own program.
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
@@ -31,9 +32,11 @@ impl Program {
     }
 }
 
-/// The command that launching a profile runs.
+/// The command that launching a profile or harness runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
+    /// Whether this program owns its arguments instead of accepting Codex flags.
+    pub custom_harness: bool,
     /// The program name shown to the user.
     pub program: String,
     pub args: Vec<String>,
@@ -43,8 +46,9 @@ pub struct Command {
     /// Whether codex-launcher.toml gave this profile its commands, so that
     /// `PATH` was not searched.
     pub configured: bool,
-    /// The wrapper that launching runs: the resolved `codex-<profile>` on
-    /// `PATH`, or the launch command that codex-launcher.toml gives.
+    /// The program that launching runs: the resolved `codex-<profile>` on
+    /// `PATH`, or the launch command that codex-launcher.toml gives. A
+    /// harness's launch program is its own, so it is reported here too.
     pub wrapper: Option<PathBuf>,
     /// The command that server checks run instead of asking the server: the
     /// resolved `codex-<profile>.status` on `PATH`, or the status command that
@@ -58,6 +62,9 @@ impl Command {
     /// arguments stay first and unchanged.
     pub fn with_effort(&self, effort: &str) -> Self {
         let mut command = self.clone();
+        if self.custom_harness {
+            return command;
+        }
         let (own, codex) = self.args.split_at(self.wrapper_arg_count);
         command.args = own.to_vec();
         command.args.extend([
@@ -84,14 +91,29 @@ impl Command {
 
     /// Build the command for `profile`, with `extra` arguments passed through.
     ///
+    /// A harness runs its own program and ignores `path`, because it replaces
+    /// Codex rather than wrapping it.
+    ///
     /// A profile that codex-launcher.toml names runs the commands it gives.
     /// Otherwise a profile named `NAME` runs `codex-NAME` instead of
     /// `codex --profile NAME` when that executable is on `path`. Either
     /// wrapper is expected to select the profile itself.
     pub fn for_profile(profile: &Profile, extra: &[String], path: Option<&OsStr>) -> Self {
-        let mut command = match &profile.wrapper {
-            Some(configured) => Self::configured(profile, configured),
-            None => Self::found(profile, path),
+        let mut command = if let Some(harness) = &profile.harness {
+            Self {
+                custom_harness: true,
+                program: harness.launch.path.to_string_lossy().into_owned(),
+                args: harness.launch.args.clone(),
+                wrapper_arg_count: harness.launch.args.len(),
+                configured: true,
+                wrapper: Some(harness.launch.path.clone()),
+                status: harness.status.clone(),
+            }
+        } else {
+            match &profile.wrapper {
+                Some(configured) => Self::configured(profile, configured),
+                None => Self::found(profile, path),
+            }
         };
         command.args.extend(extra.iter().cloned());
         command
@@ -100,6 +122,7 @@ impl Command {
     /// `codex --profile NAME`, or `codex` alone for the default entry.
     fn plain(profile: &Profile) -> Self {
         Self {
+            custom_harness: false,
             program: CODEX.to_owned(),
             args: if profile.is_default() {
                 Vec::new()
@@ -118,6 +141,7 @@ impl Command {
         let status = configured.status.clone();
         match &configured.launch {
             Some(launch) => Self {
+                custom_harness: false,
                 program: launch.path.to_string_lossy().into_owned(),
                 args: launch.args.clone(),
                 wrapper_arg_count: launch.args.len(),
@@ -144,6 +168,7 @@ impl Command {
         });
         match find_wrapper(&profile.name, path) {
             Some(wrapper) => Self {
+                custom_harness: false,
                 program: wrapper_name(&profile.name),
                 args: Vec::new(),
                 wrapper_arg_count: 0,
