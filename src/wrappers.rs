@@ -14,7 +14,6 @@
 //! directory. A problem leaves out only the command or name that has it.
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table};
@@ -37,34 +36,14 @@ pub struct Wrapper {
     pub status: Option<Program>,
 }
 
-/// Read the file in `codex_home`, if there is one, for the named profiles.
-/// Problems become warnings.
-pub fn load(
-    codex_home: &Path,
-    profiles: &[String],
-    home: Option<&Path>,
-    warnings: &mut Vec<String>,
-) -> BTreeMap<String, Wrapper> {
-    let text = match crate::profile::read_limited(&codex_home.join(FILE_NAME)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return BTreeMap::new(),
-        Err(error) => {
-            warnings.push(format!("{FILE_NAME}: cannot read file: {error}"));
-            return BTreeMap::new();
-        }
-    };
-    match text.parse::<DocumentMut>() {
-        Ok(document) => parse(&document, profiles, home, warnings),
-        Err(error) => {
-            warnings.push(format!("{FILE_NAME}: invalid TOML: {}", error.message()));
-            BTreeMap::new()
-        }
-    }
-}
-
-fn parse(
+/// The wrappers for the named profiles, read from an already parsed launcher
+/// file. Problems become warnings. `harnesses` are the names that `[[harness]]`
+/// entries claim in the same file: they launch their own program, so naming one
+/// is a mistake rather than a wrapper to build.
+pub(crate) fn parse(
     document: &DocumentMut,
     profiles: &[String],
+    harnesses: &[String],
     home: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, Wrapper> {
@@ -117,6 +96,10 @@ fn parse(
             if name == DEFAULT_PROFILE {
                 warn(format!(
                     "{DEFAULT_PROFILE:?} always runs codex with config.toml alone"
+                ));
+            } else if harnesses.iter().any(|harness| harness == name) {
+                warn(format!(
+                    "{name:?} is a harness, which launches its own program"
                 ));
             } else if !profiles.iter().any(|profile| profile == name) {
                 warn(format!("no profile is named {name:?}"));
@@ -224,9 +207,23 @@ mod tests {
     use super::*;
 
     fn parsed(text: &str, home: Option<&Path>) -> (BTreeMap<String, Wrapper>, Vec<String>) {
+        named(text, &[], home)
+    }
+
+    fn named(
+        text: &str,
+        harnesses: &[String],
+        home: Option<&Path>,
+    ) -> (BTreeMap<String, Wrapper>, Vec<String>) {
         let profiles = ["alpha", "beta", "delta", "gamma", "omega"].map(str::to_owned);
         let mut warnings = Vec::new();
-        let wrappers = parse(&text.parse().unwrap(), &profiles, home, &mut warnings);
+        let wrappers = parse(
+            &text.parse().unwrap(),
+            &profiles,
+            harnesses,
+            home,
+            &mut warnings,
+        );
         (wrappers, warnings)
     }
 
@@ -367,32 +364,34 @@ profiles = ["omega"]
     }
 
     #[test]
-    fn a_missing_file_is_fine_and_a_broken_one_is_a_warning() {
-        let home = tempfile::tempdir().unwrap();
-        let profiles = ["alpha".to_owned()];
-        let load_warnings = || {
-            let mut warnings = Vec::new();
-            assert!(load(home.path(), &profiles, None, &mut warnings).is_empty());
-            warnings
-        };
-        assert!(load_warnings().is_empty());
-
-        std::fs::write(home.path().join(FILE_NAME), "[[wrapper]\n").unwrap();
-        let warnings = load_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert!(
-            warnings[0].starts_with("codex-launcher.toml: invalid TOML: "),
-            "{warnings:?}"
-        );
-
-        std::fs::write(
-            home.path().join(FILE_NAME),
+    fn entries_have_to_be_wrapper_tables() {
+        let (wrappers, warnings) = named(
             "[wrapper]\nprofiles = [\"alpha\"]\nlaunch = [\"/bin/run\"]\n",
-        )
-        .unwrap();
+            &[],
+            None,
+        );
+        assert!(wrappers.is_empty());
         assert_eq!(
-            load_warnings(),
+            warnings,
             ["codex-launcher.toml: write each wrapper as a [[wrapper]] table"]
+        );
+    }
+
+    #[test]
+    fn naming_a_harness_takes_no_wrapper_and_says_why() {
+        // Reading the file once is what makes this warning true: the name does
+        // exist, it just belongs to an entry that launches itself.
+        let (wrappers, warnings) = named(
+            "[[wrapper]]\nprofiles = [\"bird\"]\nlaunch = [\"/bin/run\", \"{profile}\"]\n",
+            &["bird".to_owned()],
+            None,
+        );
+        assert!(wrappers.is_empty());
+        assert_eq!(
+            warnings,
+            [
+                r#"codex-launcher.toml: wrapper 1: "bird" is a harness, which launches its own program"#
+            ]
         );
     }
 }

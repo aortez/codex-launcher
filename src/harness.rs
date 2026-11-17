@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use toml_edit::{DocumentMut, Table};
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::launch::Program;
 use crate::profile::{self, Profile, Provider, Setting, Source};
@@ -18,20 +18,16 @@ pub struct Harness {
     pub tools: Option<String>,
 }
 
-pub fn load(
-    codex_home: &Path,
+/// The `[[harness]]` entries of a parsed launcher file, which came from `file`.
+/// `existing` are the profiles already loaded, whose names an entry cannot
+/// reuse. Problems become warnings.
+pub(crate) fn parse(
+    file: &Path,
+    document: &DocumentMut,
     existing: &[Profile],
     home: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> Vec<Profile> {
-    // Wrapper loading already reports read/parse failures for this shared file.
-    let path = codex_home.join(FILE_NAME);
-    let Ok(text) = profile::read_limited(&path) else {
-        return Vec::new();
-    };
-    let Ok(document) = text.parse::<DocumentMut>() else {
-        return Vec::new();
-    };
     let Some(item) = document.get("harness") else {
         return Vec::new();
     };
@@ -44,7 +40,7 @@ pub fn load(
     let mut names: BTreeSet<String> = existing.iter().map(|p| p.name.clone()).collect();
     let mut profiles = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let parsed = parse(entry, home).and_then(|(name, harness)| {
+        let parsed = parse_entry(entry, home).and_then(|(name, harness)| {
             if !names.insert(name.clone()) {
                 return Err(format!("name {name:?} is already used"));
             }
@@ -57,7 +53,7 @@ pub fn load(
             )),
             Ok((name, harness)) => profiles.push(Profile {
                 name,
-                path: path.clone(),
+                path: file.to_path_buf(),
                 description: string(entry, "description").map(str::to_owned),
                 model: setting(entry, "model"),
                 provider: Provider {
@@ -89,7 +85,27 @@ pub fn load(
     profiles
 }
 
-fn parse(entry: &Table, home: Option<&Path>) -> Result<(String, Harness), String> {
+/// The names that will become harness entries, so wrapper loading can say why
+/// one of them takes no wrapper. Names an entry cannot use are left out and
+/// reported by [`parse`]: a name a profile already holds stays the profile's,
+/// because the entry reusing it is the one that gets skipped.
+pub(crate) fn claimed_names(document: &DocumentMut, profiles: &[String]) -> Vec<String> {
+    document
+        .get("harness")
+        .and_then(Item::as_array_of_tables)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| string(entry, "name"))
+                .filter(|name| profile::is_valid_name(name))
+                .filter(|name| !profiles.iter().any(|profile| profile == name))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_entry(entry: &Table, home: Option<&Path>) -> Result<(String, Harness), String> {
     const TEXT: &[&str] = &[
         "name",
         "harness",
