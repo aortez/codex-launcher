@@ -393,10 +393,11 @@ each session:
 `Enter` runs the matching profile's launch command with `resume <id>` after it,
 the command that `codex-launcher <profile> resume <id>` runs, so a wrapper does
 its usual setup first. That works only with no launch arguments or a bare
-`resume`. Other arguments, such as `exec "fix tests"` or flags, already say what
-to run, so `Enter` shows a notice instead. In the profiles view, `Enter` still
-launches the profile with the arguments, and a bare `resume` opens Codex's own
-picker inside the profile.
+`resume`, or after `-- resume <name>` finds the name on several sessions, as
+described below. Other arguments, such as `exec "fix tests"` or flags, already
+say what to run, so `Enter` shows a notice instead. In the profiles view,
+`Enter` still launches the profile with the arguments, and a bare `resume` opens
+Codex's own picker inside the profile.
 
 `codex-launcher -- resume` opens the menu in the sessions view.
 `codex-launcher -- resume <id>` opens it with the session's profile selected,
