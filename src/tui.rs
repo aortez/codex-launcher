@@ -61,6 +61,9 @@ fn terminal_loop(
         if app.poll_checks() {
             dirty = true;
         }
+        if app.poll_sessions() {
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| ui::draw(frame, app))?;
             dirty = false;
@@ -98,6 +101,7 @@ pub fn run_headless(mut app: App, width: u16, height: u16) -> Result<ExitCode> {
     let server =
         Server::start(&control::runtime_dir()).context("headless mode needs the control socket")?;
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+    app.poll_sessions();
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     eprintln!(
         "codex-launcher: headless pid {} listening on {}",
@@ -128,8 +132,10 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Server checks finish in the background; report what has arrived.
+    // Server checks and sessions arrive in the background; report what has
+    // arrived.
     app.poll_checks();
+    app.poll_sessions();
     // Leave room within the client's five-second timeout for redrawing and
     // replying. A batch shares this budget rather than resetting it per key.
     app.set_discovery_deadline(Some(pending.received_at + effort::QUERY_TIMEOUT));

@@ -141,6 +141,8 @@ pub struct Catalog {
     pub profiles: Vec<Profile>,
     /// Problems that did not stop loading, such as skipped file names.
     pub warnings: Vec<String>,
+    /// The providers that config.toml defines, which plain `codex` knows.
+    pub base_providers: Vec<String>,
 }
 
 impl Catalog {
@@ -265,11 +267,23 @@ pub fn load(codex_home: &Path) -> Result<Catalog> {
         ));
     }
     profiles[1..].sort_by(|a, b| a.name.cmp(&b.name));
+    let base_providers = base
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter(|(_, provider)| provider.is_table_like())
+                .map(|(id, _)| id.to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(Catalog {
         codex_home: codex_home.to_path_buf(),
         profiles,
         warnings,
+        base_providers,
     })
 }
 

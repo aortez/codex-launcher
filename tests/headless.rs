@@ -15,11 +15,21 @@ fn fixture_home() -> PathBuf {
 
 fn writable_home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    for entry in std::fs::read_dir(fixture_home()).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), home.path().join(entry.file_name())).unwrap();
-    }
+    copy_tree(&fixture_home(), home.path());
     home
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -412,9 +422,41 @@ impl Headless {
         Self::launch(codex_home, &args, path, env)
     }
 
+    /// Start with server checks off, in the fixture sessions' project.
+    fn start_in_project(sessions: &SessionsFixture, args: &[&str]) -> Self {
+        Self::start_in_project_with_path(sessions, args, Path::new("/nonexistent"))
+    }
+
+    fn start_in_project_with_path(sessions: &SessionsFixture, args: &[&str], path: &Path) -> Self {
+        let args: Vec<&str> = ["--no-check", "--size", "120x40"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        Self::launch_in(
+            sessions.home.path(),
+            &args,
+            path,
+            &[],
+            Some(sessions.project.path()),
+        )
+    }
+
     fn launch(codex_home: &Path, args: &[&str], path: &Path, env: &[(&str, Option<&str>)]) -> Self {
+        Self::launch_in(codex_home, args, path, env, None)
+    }
+
+    fn launch_in(
+        codex_home: &Path,
+        args: &[&str],
+        path: &Path,
+        env: &[(&str, Option<&str>)],
+        dir: Option<&Path>,
+    ) -> Self {
         let runtime = tempfile::tempdir().unwrap();
         let mut command = Command::new(BIN);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
         command
             .arg("--headless")
             .args(args)
@@ -479,6 +521,39 @@ impl Headless {
             assert!(Instant::now() < deadline, "server checks never finished");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The state once the sessions have been read.
+    fn sessions_state(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = self.ctl_json(&["state"]);
+            if state["sessions"]["loading"] == false {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "the sessions never loaded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Select the listed session with this title, and return the state.
+    fn select_session(&self, title: &str) -> Value {
+        let state = self.sessions_state();
+        let list = state["sessions"]["list"].as_array().unwrap();
+        let index = list
+            .iter()
+            .position(|row| row["title"] == title)
+            .unwrap_or_else(|| panic!("no session {title:?} in {list:?}"));
+        let keys: Vec<&str> = std::iter::once("home")
+            .chain(std::iter::repeat_n("down", index))
+            .collect();
+        let state = self.ctl_json(&std::iter::once("key").chain(keys).collect::<Vec<_>>());
+        assert_eq!(state["sessions"]["list"][index]["title"], title);
+        state
+    }
+
+    fn screen(&self) -> String {
+        String::from_utf8(self.ctl(&["screen"]).stdout).unwrap()
     }
 
     /// Wait for the launcher to exit and return its stdout.
@@ -1781,4 +1856,472 @@ fn list_check_adds_server_states() {
     assert!(unchecked[1].get("server").is_none());
     assert!(!run(&["list"]).contains("SERVER"));
     assert_eq!(server.requests.try_iter().count(), 2);
+}
+
+const MINUTE: u64 = 60;
+const HOUR: u64 = 60 * MINUTE;
+const DAY: u64 = 24 * HOUR;
+
+/// How long before the test each fixture log last changed, by the start of
+/// its path under sessions/2026/11. Git keeps no modification times.
+const SESSION_AGES: &[(&str, u64)] = &[
+    ("01/rollout-2026-11-01T10-00-00", 30 * DAY),
+    ("07/rollout-2026-11-07T11-00-00", 15 * DAY),
+    ("19/rollout-2026-11-19T10-00-00", 3 * DAY + HOUR),
+    ("21/rollout-2026-11-21T07-00-00", DAY + 5 * HOUR),
+    ("21/rollout-2026-11-21T09-30-00", DAY + 2 * HOUR),
+    ("22/rollout-2026-11-22T06-20-00", 5 * HOUR + 30 * MINUTE),
+    ("22/rollout-2026-11-22T07-40-00", 4 * HOUR + 20 * MINUTE),
+    ("22/rollout-2026-11-22T08-30-00", 3 * HOUR + 15 * MINUTE),
+    ("22/rollout-2026-11-22T09-40-00", 2 * HOUR + 10 * MINUTE),
+    ("22/rollout-2026-11-22T10-30-00", HOUR + 30 * MINUTE),
+    ("22/rollout-2026-11-22T11-30-00", 20 * MINUTE),
+    ("22/rollout-2026-11-22T11-40-00", 10 * MINUTE),
+];
+
+/// The directory that the fixture sessions record for their project.
+const FIXTURE_PROJECT: &str = "/home/user/project";
+/// Text in every fixture transcript, which the launcher must never show.
+const TRANSCRIPT: &str = "Transcript text that the launcher never shows.";
+/// A second profile on the fixture gateway with the same model.
+const GATEWAY_BACKUP: &str = "model = \"gpt-team\"\nmodel_provider = \"gateway\"\n\n[model_providers.gateway]\nname = \"Backup gateway\"\nbase_url = \"https://backup.example.com/v1\"\n";
+/// A provider that config.toml defines and no profile uses.
+const LAB_PROVIDER: &str =
+    "\n[model_providers.lab]\nname = \"Lab\"\nbase_url = \"https://lab.example.com/v1\"\n";
+
+fn session_id(n: u16) -> String {
+    format!("019a0000-0000-7000-8000-{n:012x}")
+}
+
+/// A copy of the fixture home whose project sessions ran in a temporary
+/// project directory instead, so that a launcher started there lists them as
+/// its directory's.
+struct SessionsFixture {
+    home: tempfile::TempDir,
+    project: tempfile::TempDir,
+}
+
+impl SessionsFixture {
+    fn new() -> Self {
+        let home = writable_home();
+        let project = tempfile::tempdir().unwrap();
+        let quoted = |path: &str| serde_json::to_string(path).unwrap();
+        let (from, to) = (
+            quoted(FIXTURE_PROJECT),
+            quoted(project.path().to_str().unwrap()),
+        );
+        let month = home.path().join("sessions/2026/11");
+        let mut logs = Vec::new();
+        for day in std::fs::read_dir(&month).unwrap() {
+            for log in std::fs::read_dir(day.unwrap().path()).unwrap() {
+                logs.push(log.unwrap().path());
+            }
+        }
+        assert_eq!(logs.len(), SESSION_AGES.len());
+        for log in logs {
+            let relative = log.strip_prefix(&month).unwrap().to_str().unwrap();
+            let age = SESSION_AGES
+                .iter()
+                .find(|(prefix, _)| relative.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no age for {relative}"))
+                .1;
+            let compressed = relative.ends_with(".zst");
+            let mut bytes = std::fs::read(&log).unwrap();
+            if compressed {
+                bytes = zstd::decode_all(bytes.as_slice()).unwrap();
+            }
+            let mut bytes = String::from_utf8(bytes)
+                .unwrap()
+                .replace(&from, &to)
+                .into_bytes();
+            if compressed {
+                bytes = zstd::encode_all(bytes.as_slice(), 0).unwrap();
+            }
+            std::fs::write(&log, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
+        }
+        Self { home, project }
+    }
+
+    /// Add a second gateway profile, and a provider that only config.toml
+    /// defines.
+    fn with_backup_and_lab(self) -> Self {
+        let home = self.home.path();
+        std::fs::write(home.join("gateway-backup.config.toml"), GATEWAY_BACKUP).unwrap();
+        let config = home.join("config.toml");
+        let base = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, base + LAB_PROVIDER).unwrap();
+        self
+    }
+}
+
+/// Each listed session as "title | model | profiles".
+fn session_rows(state: &Value) -> Vec<String> {
+    state["sessions"]["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let profiles: Vec<&str> = row["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| profile.as_str().unwrap())
+                .collect();
+            format!(
+                "{} | {} | {}",
+                row["title"].as_str().unwrap(),
+                row["model"].as_str().unwrap_or("-"),
+                profiles.join(", ")
+            )
+        })
+        .collect()
+}
+
+fn assert_shows(screen: &str, expected: &[&str]) {
+    for expected in expected {
+        assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+    }
+}
+
+#[test]
+fn sessions_view_lists_this_directory_then_every_directory() {
+    let sessions = SessionsFixture::new();
+    let menu = Headless::start_in_project(&sessions, &[]);
+    // The menu reads no session logs until the view opens.
+    let state = menu.ctl_json(&["state"]);
+    assert_eq!(state["view"], "profiles");
+    assert!(state["sessions"].is_null(), "{state}");
+    assert_eq!(menu.ctl_json(&["key", "tab"])["view"], "sessions");
+
+    let state = menu.sessions_state();
+    assert_eq!(state["sessions"]["scope"], "directory");
+    // Newest first, without the exec run and the subagent thread. The local
+    // session's newer log is its second, after a model switch, but its model
+    // is its first turn's. The unnamed sessions show their branch or ID.
+    let id4 = session_id(4);
+    assert_eq!(
+        session_rows(&state),
+        [
+            "Fix the flaky tests | gpt-team | gateway",
+            "Try the local model | qwen3-coder:30b | local",
+            "unknown | - | ",
+            "docs | gpt-base | default",
+            &format!("{id4} | gpt-team | gateway"),
+        ]
+    );
+    let list = &state["sessions"]["list"];
+    assert_eq!(list[1]["logs"].as_array().unwrap().len(), 2);
+    assert!(list[3]["logs"][0].as_str().unwrap().ends_with(".jsonl.zst"));
+    assert_eq!(list[2]["error"], "session_meta records no model_provider");
+    assert_eq!(
+        state["sessions"]["warnings"],
+        serde_json::json!(["2 session logs could not be read"])
+    );
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "--profile", "gateway", "resume", session_id(1)])
+    );
+    let screen = menu.screen();
+    assert_shows(
+        &screen,
+        &[
+            " Sessions · ",
+            "Name",
+            "Updated",
+            "Model",
+            "Profile",
+            "> Fix the flaky tests",
+            "2h ago",
+            "3h ago",
+            "4h ago",
+            "1d ago",
+            "3d ago",
+            " 2 session logs could not be read ",
+            "name      Fix the flaky tests",
+            "branch    main",
+            "updated   2h ago · ",
+            "provider  gateway",
+            "profile   gateway",
+            &format!("launch    codex --profile gateway resume {}", session_id(1)),
+            "Tab profiles · a every directory · Enter resume",
+        ],
+    );
+    assert!(!screen.contains("Directory"), "{screen}");
+
+    let state = menu.ctl_json(&["key", "a"]);
+    assert_eq!(state["sessions"]["scope"], "all");
+    assert_eq!(
+        session_rows(&state),
+        [
+            "unknown | - | ",
+            "Fix the flaky tests | gpt-team | gateway",
+            "Try the local model | qwen3-coder:30b | local",
+            "unknown | - | ",
+            "Review the docs | gpt-team-mini | gateway",
+            "docs | gpt-base | default",
+            &format!("{id4} | gpt-team | gateway"),
+            "Lab notes | lab-model | ",
+            "Review the docs | gpt-base | default",
+        ]
+    );
+    // The selection stays on the same session.
+    assert_eq!(state["sessions"]["selected_index"], 1);
+    assert_shows(
+        &menu.screen(),
+        &[
+            " Sessions · every directory ",
+            "Directory",
+            "a this directory",
+        ],
+    );
+    // A log whose first line does not parse has no known directory, so only
+    // the list of every directory shows it.
+    menu.select_session("unknown");
+    assert_shows(
+        &menu.screen(),
+        &[
+            "directory unknown",
+            "error     the first record does not parse",
+            "updated   1h ago · ",
+        ],
+    );
+    let state = menu.ctl_json(&["key", "enter"]);
+    assert_eq!(state["status"], "selecting");
+    assert_eq!(
+        state["notice"],
+        "This log could not be read, so it cannot be resumed."
+    );
+    assert!(state["command"].is_null());
+
+    let state = String::from_utf8(menu.ctl(&["state"]).stdout).unwrap();
+    assert!(!state.contains(TRANSCRIPT) && !menu.screen().contains(TRANSCRIPT));
+    menu.ctl_json(&["quit"]);
+}
+
+#[test]
+fn session_details_say_which_profile_resumes_each_session() {
+    let sessions = SessionsFixture::new();
+    let menu = Headless::start_in_project(&sessions, &[]);
+    menu.ctl_json(&["key", "tab", "a"]);
+
+    menu.select_session("Review the docs");
+    assert_shows(
+        &menu.screen(),
+        &[
+            "model     gpt-team-mini  gateway uses gpt-team",
+            "profile   gateway",
+        ],
+    );
+    let state = menu.select_session("Lab notes");
+    assert!(state["command"].is_null());
+    assert_shows(
+        &menu.screen(),
+        &[
+            "> Lab notes",
+            "none",
+            "profile   none  needs a profile that uses provider lab",
+        ],
+    );
+    let state = menu.ctl_json(&["key", "enter"]);
+    assert_eq!(state["status"], "selecting");
+    assert_eq!(
+        state["notice"],
+        "No profile can resume this session: it needs provider lab."
+    );
+    let id4 = session_id(4);
+    menu.select_session(&id4);
+    let screen = menu.screen();
+    assert_shows(&screen, &[&format!("id        {id4}")]);
+    assert!(!screen.contains("branch    "), "{screen}");
+    menu.select_session("docs");
+    assert_shows(&menu.screen(), &["branch    docs", "profile   default"]);
+    menu.ctl_json(&["quit"]);
+
+    // With a second gateway profile, two profiles match the gateway sessions,
+    // and config.toml now defines the lab provider for plain `codex resume`.
+    let sessions = SessionsFixture::new().with_backup_and_lab();
+    let menu = Headless::start_in_project(&sessions, &[]);
+    menu.ctl_json(&["key", "tab", "a"]);
+    menu.select_session("Lab notes");
+    assert_shows(
+        &menu.screen(),
+        &[
+            "model     lab-model  default uses gpt-base",
+            "profile   default  (config.toml defines lab)",
+            &format!("launch    codex resume {}", session_id(6)),
+        ],
+    );
+    menu.select_session("Review the docs");
+    assert_shows(
+        &menu.screen(),
+        &["model     gpt-team-mini  the matching profiles use other models"],
+    );
+    let state = menu.select_session("Fix the flaky tests");
+    assert!(state["command"].is_null());
+    assert_shows(
+        &menu.screen(),
+        &["profile   gateway, gateway-backup  (Enter asks which)"],
+    );
+    let state = menu.ctl_json(&["key", "enter"]);
+    assert_eq!(
+        state["profile_picker"],
+        serde_json::json!({"session": session_id(1), "profiles": ["gateway", "gateway-backup"], "selected": 0})
+    );
+    assert_shows(
+        &menu.screen(),
+        &[
+            " Resume with ",
+            "Several profiles can resume \"Fix the flaky tests\".",
+            "> gateway         gpt-team",
+            "gateway-backup  gpt-team",
+            "↑/↓ choose · Enter resume · Esc cancel",
+        ],
+    );
+    assert!(menu.ctl_json(&["key", "esc"])["profile_picker"].is_null());
+    let state = menu.ctl_json(&["key", "enter", "down"]);
+    assert_eq!(
+        state["command"],
+        serde_json::json!([
+            "codex",
+            "--profile",
+            "gateway-backup",
+            "resume",
+            session_id(1)
+        ])
+    );
+    menu.ctl_json(&["key", "enter"]);
+    assert_eq!(
+        menu.finish(),
+        format!("codex --profile gateway-backup resume {}\n", session_id(1))
+    );
+}
+
+#[test]
+fn launching_a_session_resumes_it_through_its_profile() {
+    let sessions = SessionsFixture::new();
+    std::fs::write(
+        sessions.home.path().join("codex-launcher.toml"),
+        "[[wrapper]]\nprofiles = [\"gateway\"]\nlaunch = [\"/opt/gateway/run\", \"{profile}\"]\n",
+    )
+    .unwrap();
+    let menu = Headless::start_in_project(&sessions, &[]);
+    menu.ctl_json(&["key", "tab"]);
+    let state = menu.sessions_state();
+    let id1 = session_id(1);
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["/opt/gateway/run", "gateway", "resume", id1])
+    );
+    assert_shows(
+        &menu.screen(),
+        &[&format!("launch    /opt/gateway/run gateway resume {id1}")],
+    );
+    assert_eq!(menu.ctl_json(&["key", "enter"])["status"], "launching");
+    assert_eq!(
+        menu.finish(),
+        format!("/opt/gateway/run gateway resume {id1}\n")
+    );
+
+    // A bare `resume` opens the sessions view, and the command keeps it.
+    let menu = Headless::start_in_project(&sessions, &["--", "resume"]);
+    assert_eq!(menu.sessions_state()["view"], "sessions");
+    let state = menu.select_session("docs");
+    let id2 = session_id(2);
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "resume", id2])
+    );
+    // In the profiles view, Enter still leaves the choice to Codex.
+    let state = menu.ctl_json(&["key", "tab"]);
+    assert_eq!(state["command"], serde_json::json!(["codex", "resume"]));
+    menu.ctl_json(&["key", "tab", "enter"]);
+    assert_eq!(menu.finish(), format!("codex resume {id2}\n"));
+}
+
+#[test]
+fn sessions_resume_only_without_other_launch_arguments() {
+    let sessions = SessionsFixture::new();
+    for args in [&["--", "exec", "fix tests"][..], &["--", "--search"]] {
+        let menu = Headless::start_in_project(&sessions, args);
+        menu.ctl_json(&["key", "tab"]);
+        let state = menu.sessions_state();
+        assert!(state["command"].is_null(), "{args:?}");
+        assert_shows(
+            &menu.screen(),
+            &["launch    not with these launch arguments; give none, or a bare \"resume\""],
+        );
+        let state = menu.ctl_json(&["key", "enter"]);
+        assert_eq!(state["status"], "selecting", "{args:?}");
+        assert_eq!(
+            state["notice"],
+            "Sessions resume only without launch arguments, or with a bare \"resume\"."
+        );
+        // Launching a profile still passes the arguments on.
+        menu.ctl_json(&["key", "tab", "enter"]);
+        let expected = if args.len() == 3 {
+            "codex exec 'fix tests'\n"
+        } else {
+            "codex --search\n"
+        };
+        assert_eq!(menu.finish(), expected);
+    }
+}
+
+#[test]
+fn resume_arguments_select_the_sessions_profile() {
+    let sessions = SessionsFixture::new();
+    // The session's directory does not matter.
+    let resumed = |home: &Path, target: &str| {
+        let menu = Headless::start_in(home, &["--", "resume", target]);
+        let state = menu.sessions_state();
+        assert_eq!(state["view"], "profiles");
+        (menu, state)
+    };
+    let id1 = session_id(1);
+    let (menu, state) = resumed(sessions.home.path(), &id1);
+    assert_eq!(state["selected"], "gateway");
+    assert_eq!(
+        state["notice"],
+        "Selected gateway for session \"Fix the flaky tests\"."
+    );
+    menu.ctl_json(&["launch"]);
+    assert_eq!(
+        menu.finish(),
+        format!("codex --profile gateway resume {id1}\n")
+    );
+    let (_menu, state) = resumed(sessions.home.path(), "Try the local model");
+    assert_eq!(state["selected"], "local");
+
+    for (target, notice) in [
+        (
+            "Review the docs",
+            "2 sessions are named \"Review the docs\".",
+        ),
+        (
+            "Lab notes",
+            "No profile can resume \"Lab notes\": it needs provider lab.",
+        ),
+        (
+            "019a0000-0000-7000-8000-0000000000ff",
+            "No session has ID 019a0000-0000-7000-8000-0000000000ff.",
+        ),
+    ] {
+        let (_menu, state) = resumed(sessions.home.path(), target);
+        assert_eq!(state["selected"], "default", "{target}");
+        assert_eq!(state["notice"], notice, "{target}");
+    }
+
+    let sessions = sessions.with_backup_and_lab();
+    let (_menu, state) = resumed(sessions.home.path(), &id1);
+    assert_eq!(state["selected"], "default");
+    assert_eq!(
+        state["notice"],
+        "\"Fix the flaky tests\" matches gateway and gateway-backup; select one."
+    );
 }

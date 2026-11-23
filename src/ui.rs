@@ -1,19 +1,23 @@
 //! Drawing the menu and turning a frame into plain text.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use ratatui::widgets::{
+    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Scroll};
+use crate::app::{App, Page, Scroll, SessionList};
 use crate::check::{State, Status};
-use crate::launch::shell_quote;
+use crate::launch::{Command, shell_quote};
 use crate::profile::{Profile, Setting, Source};
+use crate::sessions::{self, Entry, Match, Session, clean};
 
 const LABEL_WIDTH: usize = 10;
 const MIN_LIST_WIDTH: u16 = 14;
@@ -21,7 +25,19 @@ const MAX_LIST_WIDTH: u16 = 32;
 /// A server mark and the space after it, shown once checks start.
 const MARK_WIDTH: u16 = 2;
 /// The main menu's key hints, after "↑/↓ move".
-const HINTS: &str = "e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit";
+const HINTS: &str =
+    "e effort · r recheck · Tab sessions · Enter launch · PgUp/PgDn scroll · ? help · q quit";
+/// The first hint on every page with a list.
+const MOVE_HINT: &str = "↑/↓ move";
+/// The hints that a narrow footer leaves out, in order. The arrows go first,
+/// as the keys least in need of a hint.
+const DROPPED_HINTS: [&str; 2] = [MOVE_HINT, "PgUp/PgDn scroll"];
+/// The sessions view's key hints, after "↑/↓ move".
+const SESSION_HINTS: &str =
+    "Tab profiles · a every directory · Enter resume · PgUp/PgDn scroll · ? help · q quit";
+/// The sessions view's key hints while it shows every directory.
+const ALL_SESSION_HINTS: &str =
+    "Tab profiles · a this directory · Enter resume · PgUp/PgDn scroll · ? help · q quit";
 /// The key hints while an effort override is unsaved, after "↑/↓ move".
 const OVERRIDE_HINTS: &str = "e effort · s save effort · Enter launch · ? help · q quit";
 /// The narrowest help meaning column worth keeping beside its name.
@@ -64,11 +80,12 @@ const MARKS: [(State, &str); 9] = [
     (State::Skipped, "The details pane's server line says why."),
 ];
 
-/// The menu's keys, as the help lists them.
-const KEYS: [(&str, &str); 9] = [
+/// The profiles view's keys, as the help lists them.
+const PROFILE_KEYS: [(&str, &str); 10] = [
     ("↑/↓ or k/j", "Move the selection."),
     ("Home/End or g/G", "Select the first or last profile."),
     ("PgUp/PgDn", "Scroll the details."),
+    ("Tab", "Show the sessions."),
     ("e", "Choose the reasoning effort."),
     ("s", "Save the chosen effort to the profile's file."),
     ("r", "Check the servers again."),
@@ -77,64 +94,124 @@ const KEYS: [(&str, &str); 9] = [
     ("q, Esc, or Ctrl-C", "Quit."),
 ];
 
+/// The sessions view's keys, as the help lists them.
+const SESSION_KEYS: [(&str, &str); 8] = [
+    ("↑/↓ or k/j", "Move the selection."),
+    ("Home/End or g/G", "Select the first or last session."),
+    ("PgUp/PgDn", "Scroll the details."),
+    ("Tab", "Show the profiles."),
+    ("a", "Show the sessions of every directory, or of this one."),
+    ("Enter", "Resume the selected session."),
+    ("?", "Show or hide this help."),
+    ("q, Esc, or Ctrl-C", "Quit."),
+];
+
+/// What the sessions view shows, as the help explains it.
+const SESSION_NOTES: [&str; 3] = [
+    "Sessions that ran in this directory, or in every directory after a, newest first.",
+    "Each resumes with the profile that uses the provider it recorded. When several do, its \
+     model narrows them, and Enter asks which of the rest.",
+    "Dim names are a git branch or ID, for sessions without a name.",
+];
+
+/// The sessions table's headers, with the directory last.
+const SESSION_HEADERS: [&str; 5] = ["Name", "Updated", "Model", "Profile", "Directory"];
+/// The narrowest that each sessions column shrinks to fit the screen. The
+/// last update never shrinks, since a cut one would mislead.
+const SESSION_MIN_WIDTHS: [usize; 5] = [12, usize::MAX, 10, 10, 12];
+/// The directory, which only the list of every directory shows.
+const DIRECTORY_COLUMN: usize = 4;
+const SESSION_COLUMN_SPACING: u16 = 2;
+const HIGHLIGHT_SYMBOL: &str = "> ";
+
 /// Draw the menu, fitting `app.view` and the open help to the screen.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-    let list_width = list_width(app, body.width);
-    let [list_area, details_area] =
-        Layout::horizontal([Constraint::Length(list_width), Constraint::Min(10)]).areas(body);
-
-    draw_list(frame, app, list_area);
-    draw_details(frame, app, details_area);
-    if let Some(help) = &mut app.help {
-        draw_help(frame, help, details_area);
+    match app.page() {
+        Page::Profiles => {
+            let list_width = list_width(app, body.width);
+            let [list_area, details_area] =
+                Layout::horizontal([Constraint::Length(list_width), Constraint::Min(10)])
+                    .areas(body);
+            draw_list(frame, app, list_area);
+            draw_details(frame, app, details_area);
+            // The help sits beside the list whose marks it explains.
+            if let Some(help) = &mut app.help {
+                draw_help(frame, help, details_area, Page::Profiles);
+            }
+        }
+        Page::Sessions => {
+            draw_sessions(frame, app, body);
+            if let Some(help) = &mut app.help {
+                draw_help(frame, help, body, Page::Sessions);
+            }
+        }
     }
     // The footer reads the help's scroll limit, so it comes after the help.
     draw_footer(frame, app, footer);
     if app.effort_picker.is_some() {
         draw_effort_picker(frame, app, body);
     }
+    if app.profile_picker.is_some() {
+        draw_profile_picker(frame, app, body);
+    }
 }
 
-/// Draw the help over the details pane, beside the list whose marks it explains.
-fn draw_help(frame: &mut Frame, help: &mut Scroll, area: Rect) {
+/// Draw the help for `page` over `area`.
+fn draw_help(frame: &mut Frame, help: &mut Scroll, area: Rect, page: Page) {
     frame.render_widget(Clear, area);
     let block = Block::bordered().title(" Help ");
-    let text = help_text(block.inner(area).width);
+    let text = help_text(block.inner(area).width, page);
     draw_scrolled(frame, area, block, text, help);
 }
 
-/// The help screen for a pane `width` columns wide: what the list's marks and
-/// colors mean, and the menu's keys.
-fn help_text(width: u16) -> Text<'static> {
+/// The help screen for a pane `width` columns wide: what the page's marks and
+/// colors mean, and its keys.
+fn help_text(width: u16, page: Page) -> Text<'static> {
     let width = usize::from(width);
-    let label_width = 2 + MARKS
-        .iter()
-        .map(|(state, _)| state.label().width())
-        .max()
-        .unwrap_or(0);
-    let keys_width = 2 + KEYS.iter().map(|(keys, _)| keys.width()).max().unwrap_or(0);
-
-    let mut lines = vec![Line::from("Server marks").bold()];
-    for &(state, meaning) in &MARKS {
-        let name = vec![
-            mark(Some(state)),
-            Span::styled(
-                format!("{:<label_width$}", state.label()),
-                state_style(state),
-            ),
-        ];
-        lines.extend(help_row(name, meaning, width));
-    }
-    lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::raw("Yellow").fg(Color::Yellow),
-        Span::raw(" profile names mark a file error or an undefined provider."),
-    ]));
+    let mut lines = Vec::new();
+    let keys: &[(&str, &str)] = match page {
+        Page::Profiles => {
+            let label_width = 2 + MARKS
+                .iter()
+                .map(|(state, _)| state.label().width())
+                .max()
+                .unwrap_or(0);
+            lines.push(Line::from("Server marks").bold());
+            for &(state, meaning) in &MARKS {
+                let name = vec![
+                    mark(Some(state)),
+                    Span::styled(
+                        format!("{:<label_width$}", state.label()),
+                        state_style(state),
+                    ),
+                ];
+                lines.extend(help_row(name, meaning, width));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw("Yellow").fg(Color::Yellow),
+                Span::raw(" profile names mark a file error or an undefined provider."),
+            ]));
+            &PROFILE_KEYS
+        }
+        Page::Sessions => {
+            lines.push(Line::from("Sessions").bold());
+            lines.extend(SESSION_NOTES.iter().map(|&note| Line::from(note)));
+            lines.push(Line::from(vec![
+                Span::raw("Yellow").fg(Color::Yellow),
+                Span::raw(
+                    " marks a log that could not be read, or a session that no profile can resume.",
+                ),
+            ]));
+            &SESSION_KEYS
+        }
+    };
+    let keys_width = 2 + keys.iter().map(|(keys, _)| keys.width()).max().unwrap_or(0);
     lines.push(Line::default());
     lines.push(Line::from("Menu keys").bold());
-    for &(keys, action) in &KEYS {
+    for &(keys, action) in keys {
         let name = vec![Span::raw(format!("{keys:<keys_width$}")).bold()];
         lines.extend(help_row(name, action, width));
     }
@@ -328,6 +405,9 @@ fn draw_scrolled<'a>(
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.notice {
         Some(notice) => Line::from(notice.clone()).fg(Color::Yellow),
+        None if app.profile_picker.is_some() => {
+            Line::from("↑/↓ choose · Enter resume · Esc cancel").dim()
+        }
         None if app.effort_picker.is_some() && app.effort_choices().levels.is_empty() => {
             Line::from("Enter use inherited setting · Esc cancel").dim()
         }
@@ -338,21 +418,36 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Line::from("↑/↓ scroll · Esc close").dim()
         }
         None if app.help.is_some() => Line::from("Esc close").dim(),
+        None if app.page() == Page::Sessions => {
+            let all = app.session_list().is_some_and(SessionList::shows_all);
+            hints(
+                if all {
+                    ALL_SESSION_HINTS
+                } else {
+                    SESSION_HINTS
+                },
+                area.width,
+            )
+        }
         None if app.has_effort_override() => hints(OVERRIDE_HINTS, area.width),
         None => hints(HINTS, area.width),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// `rest` after "↑/↓ move", or alone when both do not fit in `width`. The
-/// arrows are the first hint to go, as the keys least in need of one.
-fn hints(rest: &'static str, width: u16) -> Line<'static> {
-    let full = format!("↑/↓ move · {rest}");
-    if full.width() <= usize::from(width) {
-        Line::from(full).dim()
-    } else {
-        Line::from(rest).dim()
+/// "↑/↓ move", then `rest`, leaving out hints in the order of DROPPED_HINTS
+/// until the line fits in `width`.
+fn hints(rest: &str, width: u16) -> Line<'static> {
+    let mut shown: Vec<&str> = std::iter::once(MOVE_HINT)
+        .chain(rest.split(" · "))
+        .collect();
+    for dropped in DROPPED_HINTS {
+        if shown.join(" · ").width() <= usize::from(width) {
+            break;
+        }
+        shown.retain(|hint| *hint != dropped);
     }
+    Line::from(shown.join(" · ")).dim()
 }
 
 /// The details pane text for the selected profile.
@@ -417,22 +512,7 @@ pub fn details(app: &App) -> Text<'static> {
         lines.push(setting_line(profile, "sandbox", profile.sandbox.as_ref()));
         lines.push(setting_line(profile, "approval", profile.approval.as_ref()));
     }
-    match &command.wrapper {
-        // The launch command already names a wrapper from codex-launcher.toml.
-        Some(wrapper) if command.configured => {
-            lines.push(row(
-                "launch",
-                command_line(wrapper, &command.args, app.home()),
-                "",
-            ));
-        }
-        wrapper => {
-            lines.push(row("launch", command.display(), ""));
-            if let Some(wrapper) = wrapper {
-                lines.push(row("wrapper", display_path(wrapper, app.home()), ""));
-            }
-        }
-    }
+    lines.extend(launch_lines(command, app.home()));
     if let Some(status) = &command.status {
         lines.push(row(
             "status",
@@ -455,6 +535,500 @@ pub fn details(app: &App) -> Text<'static> {
         None => lines.push(Line::from(format!("{file_name} does not exist.")).dim()),
     }
     Text::from(lines)
+}
+
+/// The rows that show what launching runs.
+fn launch_lines(command: &Command, home: Option<&Path>) -> Vec<Line<'static>> {
+    match &command.wrapper {
+        // The launch command already names a wrapper from codex-launcher.toml.
+        Some(wrapper) if command.configured => {
+            vec![row(
+                "launch",
+                command_line(wrapper, &command.args, home),
+                "",
+            )]
+        }
+        wrapper => {
+            let mut lines = vec![row("launch", command.display(), "")];
+            if let Some(wrapper) = wrapper {
+                lines.push(row("wrapper", display_path(wrapper, home), ""));
+            }
+            lines
+        }
+    }
+}
+
+/// Draw the sessions table, with the selected entry's details below it.
+fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    let list = app.session_list();
+    let block = sessions_block(app, list);
+    let message = match list {
+        None => Some("Reading sessions…"),
+        Some(list) if list.is_loading() => Some("Reading sessions…"),
+        Some(list) if list.row_count() > 0 => None,
+        Some(list) if list.shows_all() => Some("No sessions in any directory."),
+        Some(_) => Some("No sessions in this directory. Press a to show every directory."),
+    };
+    let (Some(list), None) = (list, message) else {
+        let message = Paragraph::new(message.unwrap_or_default())
+            .dim()
+            .wrap(Wrap { trim: false })
+            .block(block);
+        frame.render_widget(message, area);
+        return;
+    };
+    let Some(entry) = list.selected_entry() else {
+        return;
+    };
+    let inner_width = area.width.saturating_sub(2);
+    let details = session_details(app, entry, usize::from(inner_width));
+    let details_block = Block::bordered().title(format!(" {} ", entry_title(entry)));
+    // The table keeps room for its rows, header, and borders, up to half the
+    // screen. The details take the rest that they need, and the table any
+    // room left over.
+    let table_wanted = u16::try_from(list.row_count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    let details_wanted = u16::try_from(
+        Paragraph::new(details.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width),
+    )
+    .unwrap_or(u16::MAX)
+    .saturating_add(2);
+    let height = details_wanted.min(area.height - table_wanted.min(area.height / 2));
+    let [table_area, details_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
+    let table = session_table(app, list, block, table_area.width);
+    let selected = list.selected();
+    app.view.sessions.select(Some(selected));
+    frame.render_stateful_widget(table, table_area, &mut app.view.sessions);
+    draw_scrolled(
+        frame,
+        details_area,
+        details_block,
+        details,
+        &mut app.view.session_details,
+    );
+}
+
+/// The sessions table's border, titled with the directory it lists, and with
+/// any warnings at the bottom.
+fn sessions_block(app: &App, list: Option<&SessionList>) -> Block<'static> {
+    let place = if list.is_some_and(SessionList::shows_all) {
+        "every directory".to_owned()
+    } else {
+        app.current_dir().map_or_else(
+            || "this directory".to_owned(),
+            |dir| clean(&display_path(dir, app.home())),
+        )
+    };
+    let mut block = Block::bordered().title(format!(" Sessions · {place} "));
+    if let Some(list) = list
+        && !list.warnings().is_empty()
+    {
+        let warnings = clean(&list.warnings().join("; "));
+        block = block.title_bottom(Line::from(format!(" {warnings} ")).fg(Color::Yellow));
+    }
+    block
+}
+
+fn entry_title(entry: &Entry) -> String {
+    match entry {
+        Entry::Session(session) => clean(session.title()),
+        Entry::Unknown(_) => "unknown log".to_owned(),
+    }
+}
+
+/// The sessions table, with each column fitted to `width`.
+fn session_table(
+    app: &App,
+    list: &SessionList,
+    block: Block<'static>,
+    width: u16,
+) -> Table<'static> {
+    let columns = if list.shows_all() { 5 } else { 4 };
+    let now = SystemTime::now();
+    let rows: Vec<Vec<(String, Style)>> = list
+        .rows()
+        .map(|entry| {
+            let mut cells = session_cells(app, entry, now);
+            cells.truncate(columns);
+            cells
+        })
+        .collect();
+    let headers = &SESSION_HEADERS[..columns];
+    let mut wanted: Vec<usize> = headers.iter().map(|header| header.width()).collect();
+    for cells in &rows {
+        for (column, (text, _)) in cells.iter().enumerate() {
+            wanted[column] = wanted[column].max(text.width());
+        }
+    }
+    let spacing = usize::from(SESSION_COLUMN_SPACING) * (columns - 1);
+    // The borders, the highlight symbol, and a margin on the right take room
+    // too.
+    let available = usize::from(width).saturating_sub(2 + HIGHLIGHT_SYMBOL.width() + spacing + 1);
+    let widths = fit_columns(
+        wanted,
+        &SESSION_MIN_WIDTHS[..columns],
+        DIRECTORY_COLUMN,
+        available,
+    );
+    let rows = rows.into_iter().map(|cells| {
+        Row::new(
+            cells
+                .into_iter()
+                .enumerate()
+                .map(|(column, (text, style))| {
+                    // A directory keeps its last components, which tell
+                    // directories apart.
+                    let text = if column == DIRECTORY_COLUMN {
+                        truncate_left(&text, widths[column])
+                    } else {
+                        truncate(&text, widths[column])
+                    };
+                    Cell::from(Span::styled(text, style))
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    let constraints = widths
+        .iter()
+        .map(|&width| Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX)));
+    Table::new(rows, constraints)
+        .header(Row::new(headers.iter().copied()).bold())
+        .column_spacing(SESSION_COLUMN_SPACING)
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .block(block)
+}
+
+/// A sessions table row's cells, before fitting: name, last update, model,
+/// profile, and directory.
+fn session_cells(app: &App, entry: &Entry, now: SystemTime) -> Vec<(String, Style)> {
+    let plain = Style::new();
+    let yellow = Style::new().fg(Color::Yellow);
+    match entry {
+        Entry::Session(session) => {
+            let matched = app.session_match(session);
+            let profile = if matched.profiles.is_empty() {
+                ("none".to_owned(), yellow)
+            } else {
+                (profile_names(app, &matched), plain)
+            };
+            let name_style = if session.name.is_some() {
+                plain
+            } else {
+                Style::new().add_modifier(Modifier::DIM)
+            };
+            vec![
+                (clean(session.title()), name_style),
+                (sessions::ago(session.updated, now), plain),
+                (
+                    session.model.as_deref().map(clean).unwrap_or_default(),
+                    plain,
+                ),
+                profile,
+                (clean(&display_path(&session.cwd, app.home())), plain),
+            ]
+        }
+        Entry::Unknown(unknown) => vec![
+            ("unknown".to_owned(), yellow),
+            (sessions::ago(unknown.updated, now), plain),
+            (String::new(), plain),
+            (String::new(), plain),
+            (
+                unknown
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| clean(&display_path(cwd, app.home())))
+                    .unwrap_or_default(),
+                plain,
+            ),
+        ],
+    }
+}
+
+fn profile_names(app: &App, matched: &Match) -> String {
+    matched
+        .profiles
+        .iter()
+        .map(|&index| app.catalog().profiles[index].name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Column widths that fit in `available`: the `wanted` widths, shrunk but
+/// none below its minimum. The column `first` gives up its room first, then
+/// the widest column. The first column takes any room left over.
+fn fit_columns(
+    mut widths: Vec<usize>,
+    minimum: &[usize],
+    first: usize,
+    available: usize,
+) -> Vec<usize> {
+    let mut total: usize = widths.iter().sum();
+    if first < widths.len() {
+        let spare = widths[first].saturating_sub(minimum[first]);
+        let given = spare.min(total.saturating_sub(available));
+        widths[first] -= given;
+        total -= given;
+    }
+    while total > available {
+        let Some(widest) = (0..widths.len())
+            .filter(|&column| widths[column] > minimum[column])
+            .max_by_key(|&column| widths[column])
+        else {
+            break;
+        };
+        widths[widest] -= 1;
+        total -= 1;
+    }
+    if total < available {
+        widths[0] += available - total;
+    }
+    widths
+}
+
+/// `text` cut to `width` columns, ending in an ellipsis when cut.
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        used += c.width().unwrap_or(0);
+        if used >= width {
+            break;
+        }
+        kept.push(c);
+    }
+    if width > 0 {
+        kept.push('…');
+    }
+    kept
+}
+
+/// `text` cut to its last `width` columns, starting with an ellipsis when cut.
+fn truncate_left(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        used += c.width().unwrap_or(0);
+        if used >= width {
+            break;
+        }
+        kept.push(c);
+    }
+    let ellipsis = (width > 0).then_some('…');
+    ellipsis.into_iter().chain(kept.into_iter().rev()).collect()
+}
+
+/// The details pane text, `width` columns wide, for a session or a log that
+/// could not be read.
+fn session_details(app: &App, entry: &Entry, width: usize) -> Text<'static> {
+    let now = SystemTime::now();
+    let updated = |time| {
+        format!(
+            "{} · {}",
+            sessions::ago(time, now),
+            sessions::utc_minute(time)
+        )
+    };
+    let path =
+        |name: &str, path: &Path| path_rows(name, &clean(&display_path(path, app.home())), width);
+    let mut lines = Vec::new();
+    match entry {
+        Entry::Unknown(unknown) => {
+            lines.extend(path("log", &unknown.path));
+            match &unknown.cwd {
+                Some(cwd) => lines.extend(path("directory", cwd)),
+                None => lines.push(row("directory", "unknown".to_owned(), "")),
+            }
+            lines.push(row("updated", updated(unknown.updated), ""));
+            lines.push(Line::from(vec![
+                label("error"),
+                Span::raw(clean(&unknown.error)).fg(Color::Yellow),
+            ]));
+        }
+        Entry::Session(session) => {
+            let matched = app.session_match(session);
+            if let Some(name) = &session.name {
+                lines.push(row("name", clean(name), ""));
+            }
+            lines.push(row("id", session.id.clone(), ""));
+            lines.extend(path("directory", &session.cwd));
+            if let Some(branch) = &session.branch {
+                lines.push(row("branch", clean(branch), ""));
+            }
+            lines.push(row("updated", updated(session.updated), ""));
+            lines.push(row("provider", clean(&session.provider), ""));
+            let mut model = match &session.model {
+                Some(model) => row("model", clean(model), ""),
+                None => row("model", "(not recorded)".to_owned(), ""),
+            };
+            if matched.model_differs {
+                model.push_span(
+                    Span::raw(format!("  {}", other_model(app, &matched))).fg(Color::Yellow),
+                );
+            }
+            lines.push(model);
+            lines.push(session_profile_line(app, session, &matched));
+            if let &[index] = matched.profiles.as_slice() {
+                match app.session_command(session, index) {
+                    Some(command) => lines.extend(launch_lines(&command, app.home())),
+                    None => lines.push(Line::from(vec![
+                        label("launch"),
+                        Span::raw(
+                            "not with these launch arguments; give none, or a bare \"resume\"",
+                        )
+                        .fg(Color::Yellow),
+                    ])),
+                }
+            }
+            let logs = if session.logs.len() > 1 {
+                "logs"
+            } else {
+                "log"
+            };
+            for (index, log) in session.logs.iter().enumerate() {
+                lines.extend(path(if index == 0 { logs } else { "" }, log));
+            }
+        }
+    }
+    Text::from(lines)
+}
+
+/// Rows that show `path` beside the label `name` in `width` columns. A long
+/// path breaks after a slash where it can, or else after a hyphen or an
+/// underscore, and continues under the value. A row never holds only the
+/// character that it breaks after.
+fn path_rows(name: &str, path: &str, width: usize) -> Vec<Line<'static>> {
+    let column = width.saturating_sub(LABEL_WIDTH).max(1);
+    let mut parts = Vec::new();
+    let mut rest = path;
+    loop {
+        let mut end = 0;
+        let mut used = 0;
+        for (index, c) in rest.char_indices() {
+            used += c.width().unwrap_or(0);
+            if used > column && end > 0 {
+                break;
+            }
+            end = index + c.len_utf8();
+        }
+        if end >= rest.len() {
+            parts.push(rest);
+            break;
+        }
+        let cut = rest[..end]
+            .rfind('/')
+            .filter(|&index| index > 0)
+            .or_else(|| rest[..end].rfind(['-', '_']).filter(|&index| index > 0))
+            .map_or(end, |index| index + 1);
+        parts.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| row(if index == 0 { name } else { "" }, part.to_owned(), ""))
+        .collect()
+}
+
+/// What the matching profiles use instead of the session's model.
+fn other_model(app: &App, matched: &Match) -> String {
+    match matched.profiles.as_slice() {
+        &[index] => {
+            let profile = &app.catalog().profiles[index];
+            match profile.model_name() {
+                Some(model) => format!("{} uses {}", profile.name, clean(model)),
+                None => format!("{} uses Codex's default model", profile.name),
+            }
+        }
+        _ => "the matching profiles use other models".to_owned(),
+    }
+}
+
+fn session_profile_line(app: &App, session: &Session, matched: &Match) -> Line<'static> {
+    let provider = clean(&session.provider);
+    match matched.profiles.as_slice() {
+        [] => Line::from(vec![
+            label("profile"),
+            Span::raw("none").fg(Color::Yellow),
+            Span::raw(format!("  needs a profile that uses provider {provider}")).fg(Color::Yellow),
+        ]),
+        [_] if matched.fallback => {
+            let reason = if app.catalog().base_providers.contains(&session.provider) {
+                format!("(config.toml defines {provider})")
+            } else {
+                format!("({provider} is built in)")
+            };
+            row("profile", profile_names(app, matched), &reason)
+        }
+        [_] => row("profile", profile_names(app, matched), ""),
+        _ => row("profile", profile_names(app, matched), "(Enter asks which)"),
+    }
+}
+
+/// The popup that asks which profile resumes a session.
+fn draw_profile_picker(frame: &mut Frame, app: &App, body: Rect) {
+    let picker = app.profile_picker.as_ref().unwrap();
+    let profiles = &app.catalog().profiles;
+    let name_width = picker
+        .profiles
+        .iter()
+        .map(|&index| profiles[index].name.width())
+        .max()
+        .unwrap_or(0);
+    let items: Vec<ListItem> = picker
+        .profiles
+        .iter()
+        .map(|&index| {
+            let profile = &profiles[index];
+            let model = profile
+                .model_name()
+                .map_or_else(|| "(Codex default)".to_owned(), clean);
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{:<name_width$}  ", profile.name)),
+                Span::raw(model).dim(),
+            ]))
+        })
+        .collect();
+    let height = u16::try_from(items.len() + 4)
+        .unwrap_or(u16::MAX)
+        .min(body.height);
+    let width = 60.min(body.width);
+    let area = Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(" Resume with ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [note, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+    let title = app
+        .picker_session()
+        .map(|session| clean(session.title()))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(format!("Several profiles can resume {title:?}."))
+            .dim()
+            .wrap(Wrap { trim: false }),
+        note,
+    );
+    let list_widget = List::new(items)
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(list_widget, list, &mut state);
 }
 
 /// The tag that marks where a value came from.
@@ -550,15 +1124,17 @@ fn state_style(state: State) -> Style {
     }
 }
 
-fn row(label: &str, value: String, tag: &str) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw(format!("{label:<LABEL_WIDTH$}")).bold(),
-        Span::raw(value),
-    ];
+fn row(name: &str, value: String, tag: &str) -> Line<'static> {
+    let mut spans = vec![label(name), Span::raw(value)];
     if !tag.is_empty() {
         spans.push(Span::raw(format!("  {tag}")).dim());
     }
     Line::from(spans)
+}
+
+/// A details row's label, padded to line up the values.
+fn label(name: &str) -> Span<'static> {
+    Span::raw(format!("{name:<LABEL_WIDTH$}")).bold()
 }
 
 /// Show `path` relative to `home` as `~/...` when it is inside it.
@@ -608,7 +1184,7 @@ pub fn buffer_text(buffer: &Buffer) -> String {
 mod tests {
     use super::*;
     use crate::app::Key;
-    use crate::test_support::{fixture_app, fixture_home};
+    use crate::test_support::{fixture_app, fixture_home, wait_for_sessions};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -714,12 +1290,16 @@ mod tests {
         };
         let (_home, mut app) = fixture_app();
         assert_eq!(
-            footer(&mut app, 83),
-            "↑/↓ move · e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit"
+            footer(&mut app, 98),
+            "↑/↓ move · e effort · r recheck · Tab sessions · Enter launch · PgUp/PgDn scroll · ? help · q quit"
         );
         assert_eq!(
-            footer(&mut app, 82),
-            "e effort · r recheck · Enter launch · PgUp/PgDn scroll · ? help · q quit"
+            footer(&mut app, 97),
+            "e effort · r recheck · Tab sessions · Enter launch · PgUp/PgDn scroll · ? help · q quit"
+        );
+        assert_eq!(
+            footer(&mut app, 86),
+            "e effort · r recheck · Tab sessions · Enter launch · ? help · q quit"
         );
         app.set_effort("low").unwrap();
         assert_eq!(
@@ -825,7 +1405,7 @@ mod tests {
 
     #[test]
     fn tiny_terminal_does_not_panic() {
-        let (_home, mut app) = fixture_app();
+        let (home, mut app) = fixture_app();
         for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0)] {
             let _ = render(&mut app, width, height);
             app.press(Key::Char('e'));
@@ -835,6 +1415,160 @@ mod tests {
             let _ = render(&mut app, width, height);
             app.press(Key::Esc);
         }
+
+        // Two profiles resume the gateway sessions, so Enter opens a picker.
+        std::fs::write(
+            home.path().join("gateway-backup.config.toml"),
+            "model = 'gpt-team'\nmodel_provider = 'gateway'\n\n[model_providers.gateway]\nbase_url = 'https://backup.example.com/v1'\n",
+        )
+        .unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        app.set_current_dir(Path::new("/home/user/project"));
+        app.press(Key::Tab);
+        for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0)] {
+            let _ = render(&mut app, width, height);
+        }
+        wait_for_sessions(&mut app);
+        for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0), (30, 8)] {
+            for key in [Key::Char('a'), Key::Char('a'), Key::Char('?'), Key::Esc] {
+                app.press(key);
+                let _ = render(&mut app, width, height);
+            }
+        }
+        let gateway = app
+            .session_list()
+            .unwrap()
+            .rows()
+            .position(|entry| {
+                entry
+                    .session()
+                    .is_some_and(|session| session.provider == "gateway")
+            })
+            .unwrap();
+        for _ in 0..gateway {
+            app.press(Key::Down);
+        }
+        app.press(Key::Enter);
+        assert!(app.profile_picker.is_some());
+        for (width, height) in [(1, 1), (10, 3), (20, 5), (0, 0)] {
+            let _ = render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn sessions_mark_what_cannot_resume_in_yellow() {
+        let (_home, mut app) = fixture_app();
+        app.set_current_dir(Path::new("/home/user/project"));
+        app.press(Key::Tab);
+        wait_for_sessions(&mut app);
+        app.press(Key::Char('a'));
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        // The style of the first cell of `text` in the first line that
+        // contains `row`.
+        let style_of = |terminal: &Terminal<TestBackend>, row: &str, text: &str| {
+            let buffer = terminal.backend().buffer();
+            let screen = buffer_text(buffer);
+            let (y, line) = screen
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(row))
+                .unwrap_or_else(|| panic!("{row:?} missing:\n{screen}"));
+            let x = line[..line.find(text).unwrap()].width();
+            buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())].style()
+        };
+        let select = |app: &mut App, title: &str| {
+            let index = app
+                .session_list()
+                .unwrap()
+                .rows()
+                .position(|entry| {
+                    entry
+                        .session()
+                        .is_some_and(|session| session.title() == title)
+                })
+                .unwrap();
+            app.press(Key::Home);
+            for _ in 0..index {
+                app.press(Key::Down);
+            }
+        };
+        let yellow = Some(Color::Yellow);
+
+        select(&mut app, "Review the docs");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            style_of(&terminal, "gateway uses gpt-team", "gateway").fg,
+            yellow
+        );
+        assert_eq!(style_of(&terminal, "│  unknown", "unknown").fg, yellow);
+        assert_ne!(
+            style_of(&terminal, "│> Review the docs", "Review").fg,
+            yellow
+        );
+        // A session without a name shows its branch, dimmed.
+        let branch = style_of(&terminal, "│  docs", "docs");
+        assert!(branch.add_modifier.contains(Modifier::DIM));
+
+        select(&mut app, "Lab notes");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(style_of(&terminal, "│> Lab notes", "none").fg, yellow);
+        assert_eq!(
+            style_of(&terminal, "none  needs a profile", "none").fg,
+            yellow
+        );
+    }
+
+    #[test]
+    fn columns_shrink_the_directory_first_then_the_widest() {
+        // Name, update, model, profile, and directory.
+        let minimum = SESSION_MIN_WIDTHS;
+        let fit = |wanted: &[usize], available| {
+            fit_columns(wanted.to_vec(), &minimum, DIRECTORY_COLUMN, available)
+        };
+        assert_eq!(fit(&[20, 6, 8, 7, 30], 100), [49, 6, 8, 7, 30]);
+        assert_eq!(fit(&[20, 6, 8, 7, 30], 60), [20, 6, 8, 7, 19]);
+        // On a tie, the later column gives way, so the name keeps its room.
+        assert_eq!(fit(&[40, 6, 20, 7, 30], 60), [18, 6, 17, 7, 12]);
+        // Nothing shrinks below its minimum, even when the screen is too narrow.
+        assert_eq!(fit(&[40, 7, 20, 20, 30], 10), [12, 7, 10, 10, 12]);
+        assert_eq!(truncate("Fix the flaky tests", 10), "Fix the f…");
+        assert_eq!(truncate("界界界", 4), "界…");
+        assert_eq!(truncate_left("/home/user/project", 10), "…r/project");
+        assert_eq!(truncate("short", 5), "short");
+    }
+
+    #[test]
+    fn long_paths_break_beside_their_label() {
+        let rows = |path: &str, width| -> Vec<String> {
+            path_rows("log", path, width)
+                .iter()
+                .map(|line| line.to_string())
+                .collect()
+        };
+        assert_eq!(
+            rows(
+                "~/.codex/sessions/2026/11/22/rollout-2026-11-22T09-40-00-019a.jsonl",
+                40
+            ),
+            [
+                "log       ~/.codex/sessions/2026/11/22/",
+                "          rollout-2026-11-22T09-40-00-",
+                "          019a.jsonl",
+            ]
+        );
+        assert_eq!(rows("/work", 40), ["log       /work"]);
+        assert_eq!(
+            rows("/workspaces-of-mine/x", 20),
+            [
+                "log       /workspace",
+                "          s-of-mine/",
+                "          x"
+            ]
+        );
+        assert_eq!(
+            rows("abcdefgh", 13),
+            ["log       abc", "          def", "          gh"]
+        );
     }
 
     #[test]
