@@ -107,6 +107,11 @@ effort = "medium"
 tools = "project Docker; no external network"
 ```
 
+The example launches the chat console from
+[Playtime](https://github.com/aortez/playtime), whose
+[launcher guide](https://github.com/aortez/playtime/blob/main/docs/rust-chat-launcher.md)
+covers installing the console and its other entries.
+
 `name`, `harness` and `launch` are required. Names use the same letters, digits,
 hyphens and underscores as profiles and must be unique across both kinds of
 entry; `default` is reserved. Commands use absolute or `~/` program paths and
