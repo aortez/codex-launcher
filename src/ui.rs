@@ -1476,16 +1476,14 @@ mod tests {
             let x = line[..line.find(text).unwrap()].width();
             buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())].style()
         };
-        let select = |app: &mut App, title: &str| {
+        // Select by ID: two sessions are named "Review the docs", and git keeps
+        // no modification times to order them by.
+        let select = |app: &mut App, id: &str| {
             let index = app
                 .session_list()
                 .unwrap()
                 .rows()
-                .position(|entry| {
-                    entry
-                        .session()
-                        .is_some_and(|session| session.title() == title)
-                })
+                .position(|entry| entry.session().is_some_and(|session| session.id == id))
                 .unwrap();
             app.press(Key::Home);
             for _ in 0..index {
@@ -1494,7 +1492,8 @@ mod tests {
         };
         let yellow = Some(Color::Yellow);
 
-        select(&mut app, "Review the docs");
+        // The "Review the docs" session on the gateway, with another model.
+        select(&mut app, "019a0000-0000-7000-8000-000000000005");
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(
             style_of(&terminal, "gateway uses gpt-team", "gateway").fg,
@@ -1509,7 +1508,8 @@ mod tests {
         let branch = style_of(&terminal, "│  docs", "docs");
         assert!(branch.add_modifier.contains(Modifier::DIM));
 
-        select(&mut app, "Lab notes");
+        // "Lab notes", whose provider no profile uses.
+        select(&mut app, "019a0000-0000-7000-8000-000000000006");
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(style_of(&terminal, "│> Lab notes", "none").fg, yellow);
         assert_eq!(
