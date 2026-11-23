@@ -115,12 +115,17 @@ with a warning; it never falls back to Codex. `status` is optional and must be
 read-only. Without it, server checks are skipped for that entry.
 
 Launching preserves the current directory and passes additional arguments
-unchanged to the configured program. The program owns model startup, tools,
+unchanged to the configured program. The launcher replaces itself with the
+program, as it does with Codex, so the program has the terminal, `Ctrl-C`
+interrupts it, and its exit status is the launcher's. A program that cannot run
+is an error, never a reason to run Codex. The program owns model startup, tools,
 sessions and cleanup. The launcher does not inherit `config.toml`, look up Codex
 or Ollama model capabilities, or add Codex arguments. The optional model,
 provider, context, effort and tools fields describe the preset; they do not
 configure the harness. The effort picker shows the preset and cannot change or
 save it. Existing Codex profiles retain their normal effort controls.
+
+![The details pane for playtime, a harness entry, with its preset values, its status command's report, and its table from codex-launcher.toml](docs/images/harness.png)
 
 ## Usage
 

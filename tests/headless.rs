@@ -141,6 +141,205 @@ fn custom_harness_uses_own_commands_status_and_effort_policy() {
 }
 
 #[test]
+fn harness_dry_run_exit_status_and_launch_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    // Codex is on PATH, but must never run in place of a harness.
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\nprintf 'unexpected' > \"$0.called\"\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failing = bin.path().join("failing");
+    std::fs::write(&failing, "#!/bin/sh\necho \"failing $*\" >&2\nexit 7\n").unwrap();
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let unexecutable = bin.path().join("unexecutable");
+    std::fs::write(&unexecutable, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&unexecutable, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let absent = bin.path().join("absent");
+    let entries: String = [&failing, &unexecutable, &absent]
+        .iter()
+        .map(|program| {
+            format!(
+                "[[harness]]\nname='{}'\nharness='Chat'\nlaunch=['{}', 'fixed argument']\n",
+                program.file_name().unwrap().to_str().unwrap(),
+                program.display()
+            )
+        })
+        .collect();
+    std::fs::write(home.path().join("codex-launcher.toml"), entries).unwrap();
+    let launcher = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .env("CODEX_HOME", home.path())
+            .env("PATH", bin.path())
+            .output()
+            .unwrap()
+    };
+
+    let output = launcher(&["failing", "--dry-run", "it's"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{} 'fixed argument' 'it'\\''s'\n", failing.display())
+    );
+
+    // The launcher becomes the harness, so it exits as the harness does.
+    let output = launcher(&["failing", "--flag"]);
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "failing fixed argument --flag\n"
+    );
+
+    for (program, problem) in [
+        (&unexecutable, "Permission denied (os error 13)"),
+        (&absent, "No such file or directory (os error 2)"),
+    ] {
+        let name = program.file_name().unwrap().to_str().unwrap();
+        let output = launcher(&[name]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "codex-launcher: cannot run {}: {problem}\n",
+                program.display()
+            )
+        );
+    }
+    assert!(!codex.with_extension("called").exists());
+}
+
+#[test]
+fn the_menu_hands_its_terminal_to_a_harness() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A child that the test kills if it ends early.
+    struct Reaped(Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // script from util-linux runs the menu in a pseudo-terminal. Other
+    // versions take other options.
+    let version = Command::new("script").arg("--version").output();
+    if !version.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("util-linux")) {
+        eprintln!("skipped: this test needs script from util-linux");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let report = bin.path().join("report");
+    let chat = bin.path().join("chat");
+    // Report where the harness runs, then wait for Ctrl-C. The report is
+    // renamed into place, so the test never reads part of it. Some versions
+    // of tty print no newline, so echo adds one.
+    std::fs::write(
+        &chat,
+        "#!/bin/sh\nPATH=/usr/bin:/bin\n{ echo $$; echo \"$(tty)\"; pwd; printf '%s\\n' \"$@\"; stty -a; } > \"$REPORT.part\"\nmv \"$REPORT.part\" \"$REPORT\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&chat, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        home.path().join("codex-launcher.toml"),
+        format!(
+            "[[harness]]\nname='chat'\nharness='Chat'\nlaunch=['{}', 'fixed argument']\n",
+            chat.display()
+        ),
+    )
+    .unwrap();
+    // A new pseudo-terminal has no size until something sets one. As in the
+    // other tests, the menu finds no programs on PATH.
+    let menu = format!(
+        "stty cols 100 rows 30 && exec env PATH=/nonexistent '{BIN}' --no-check -- 'literal ; $(x)'"
+    );
+    let mut script = Reaped(
+        Command::new("script")
+            .args(["--quiet", "--return", "--command", &menu, "/dev/null"])
+            .current_dir(project.path())
+            .env("CODEX_HOME", home.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("REPORT", &report)
+            // script runs the command with $SHELL.
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let sockets = runtime.path().join("codex-launcher");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_dir(&sockets).is_ok_and(|mut entries| entries.next().is_some()) {
+        assert!(Instant::now() < deadline, "the menu never listened");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ctl = |args: &[&str]| -> Value {
+        let output = Command::new(BIN)
+            .arg("ctl")
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    assert_eq!(ctl(&["select", "chat"])["mode"], "tui");
+    let state = ctl(&["launch"]);
+    assert_eq!(state["status"], "launching");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !report.exists() {
+        assert!(Instant::now() < deadline, "the harness never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = std::fs::read_to_string(&report).unwrap();
+    let mut lines = text.lines();
+    // The harness replaced the menu's process, so it has the menu's terminal
+    // and directory.
+    assert_eq!(
+        lines.next(),
+        Some(state["pid"].to_string().as_str()),
+        "{text}"
+    );
+    assert_eq!(lines.next(), state["tty"].as_str(), "{text}");
+    assert_eq!(lines.next(), project.path().to_str(), "{text}");
+    assert_eq!(lines.next(), Some("fixed argument"));
+    assert_eq!(lines.next(), Some("literal ; $(x)"));
+    // The menu restored the terminal's line settings before the handoff.
+    let settings: Vec<&str> = lines.flat_map(str::split_whitespace).collect();
+    for setting in ["icanon", "echo", "isig"] {
+        assert!(settings.contains(&setting), "{setting} is off:\n{text}");
+    }
+
+    // Ctrl-C at the terminal interrupts the harness, which script reports as
+    // a shell does: 128 plus SIGINT.
+    let stdin = script.0.stdin.as_mut().unwrap();
+    stdin.write_all(b"\x03").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = script.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl-C did not interrupt the harness"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
 fn codex_catalog_takes_precedence_and_is_queried_once_per_profile() {
     use std::os::unix::fs::PermissionsExt;
     let home = writable_home();
