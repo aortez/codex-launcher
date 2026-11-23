@@ -10,6 +10,7 @@ mod ollama;
 mod process;
 mod profile;
 mod provider;
+mod sessions;
 mod tui;
 mod ui;
 mod wrappers;
@@ -43,10 +44,12 @@ launch and status commands that the file gives it; see the README.
 Standalone [[harness]] entries in that file run their own programs without
 Codex configuration inheritance or generated Codex arguments.
 
-In the menu, press ? to see what the keys and the server marks mean.
+In the menu, press ? to see what the keys and the server marks mean, and
+Tab to list Codex sessions and resume one through the profile that can.
 
 Examples:
   codex-launcher                      Open the menu.
+  codex-launcher -- resume            Open the menu's sessions view.
   codex-launcher -- resume --last     Open the menu; pass the args to Codex.
   codex-launcher work exec 'hi'       Launch the work profile directly.
   codex-launcher list
@@ -473,19 +476,30 @@ fn print_json(value: &Value) -> Result<()> {
 #[cfg(test)]
 mod test_support {
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
-    use crate::app::App;
+    use crate::app::{App, SessionList};
     use crate::profile;
 
     /// A copy of the fake Codex home in tests/fixtures.
     pub fn fixture_home() -> tempfile::TempDir {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-home");
         let home = tempfile::tempdir().unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), home.path().join(entry.file_name())).unwrap();
-        }
+        copy_tree(&source, home.path());
         home
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir(&target).unwrap();
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 
     /// A menu over the fixture home, with no wrappers on the search path.
@@ -494,6 +508,16 @@ mod test_support {
         let catalog = profile::load(home.path()).unwrap();
         let app = App::new(catalog, &[], None, None);
         (home, app)
+    }
+
+    /// Wait until the menu has read the sessions that it started reading.
+    pub fn wait_for_sessions(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session_list().is_none_or(SessionList::is_loading) {
+            assert!(Instant::now() < deadline, "the sessions never loaded");
+            app.poll_sessions();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

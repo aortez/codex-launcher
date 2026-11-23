@@ -1,7 +1,8 @@
 # codex-launcher
 
 A terminal menu for choosing a [Codex CLI](https://github.com/openai/codex)
-profile or a custom harness and launching it. You can also list, inspect, and launch
+profile or a custom harness and launching it, or for resuming a Codex session
+through the profile that can resume it. You can also list, inspect, and launch
 profiles from the command line, and another program can read and drive a
 running menu through `codex-launcher ctl`.
 
@@ -126,6 +127,7 @@ save it. Existing Codex profiles retain their normal effort controls.
 ```sh
 codex-launcher                         # Open the menu.
 codex-launcher -- resume --last        # Open the menu; pass the arguments to Codex.
+codex-launcher -- resume               # Open the menu's sessions view.
 codex-launcher local                   # Launch a profile without the menu.
 codex-launcher local exec "fix tests"  # Arguments after the profile go to Codex.
 codex-launcher local --dry-run         # Print the command instead of running it.
@@ -147,9 +149,10 @@ can only be launched from the menu.
 
 In the menu, `↑`/`↓` (or `k`/`j`) move, `Home`/`End` (or `g`/`G`) jump to the
 first or last profile, `PgUp`/`PgDn` scroll the details, `r` checks the model
-servers again, `?` shows what the keys and the server marks mean, `Enter`
-launches, and `q`, `Esc`, or `Ctrl-C` quits. Launching replaces the launcher
-process with the selected program, which gets the terminal.
+servers again, `Tab` switches to the [sessions](#sessions), `?` shows what the
+keys and the server marks mean, `Enter` launches, and `q`, `Esc`, or `Ctrl-C`
+quits. Launching replaces the launcher process with the selected program, which
+gets the terminal.
 
 ### Server checks
 
@@ -354,6 +357,83 @@ arguments use this unverified fallback. Wrappers must forward the generated
 arguments to Codex. The settings pane still shows the base/profile values;
 it does not resolve project or managed configuration layers.
 
+### Sessions
+
+Press `Tab` to switch to the sessions view. It lists the Codex sessions that ran
+in the current directory, newest first, and `a` switches it to every directory
+and back. Each row shows the session's name, when it last changed, its model,
+and the profile that resumes it. A session without a name shows its git branch
+instead, dimmed, or its ID when Codex recorded no branch.
+
+![The sessions view listing every directory, with the details of a session whose model its profile does not use](docs/images/sessions.png)
+
+Codex records the model provider of each session, and `codex resume` works only
+when the running configuration defines that provider. A session started with a
+profile whose provider only that profile's file defines cannot be resumed by
+plain `codex resume`. Codex's own picker runs inside one configuration, so it
+cannot list sessions across profiles. The sessions view finds the profile for
+each session:
+
+- A profile matches when its effective provider is the one that the session
+  recorded. When several profiles use it, the session's model narrows them, and
+  when more than one still matches, `Enter` asks which to use.
+- When no profile uses the provider, `default` matches if `config.toml` defines
+  the provider or Codex has it built in, since plain `codex resume` can resume
+  the session then.
+- Otherwise the session's profile is `none`, in yellow, and the details name the
+  provider that it needs.
+- A session's model is its first turn's, since that reflects the profile that
+  started it. When the matching profile uses another model, the details say so.
+  The note is yellow when the profile launches through a wrapper or uses the
+  `ollama` or `lmstudio` provider, since resuming may then load the other model
+  on a server that you run.
+- Custom harness entries never match, and neither does a profile with a file
+  error or an undefined provider.
+
+`Enter` runs the matching profile's launch command with `resume <id>` after it,
+the command that `codex-launcher <profile> resume <id>` runs, so a wrapper does
+its usual setup first. That works only with no launch arguments or a bare
+`resume`, or after `-- resume <name>` finds the name on several sessions, as
+described below. Other arguments, such as `exec "fix tests"` or flags, already
+say what to run, so `Enter` shows a notice instead. In the profiles view,
+`Enter` still launches the profile with the arguments, and a bare `resume` opens
+Codex's own picker inside the profile.
+
+`codex-launcher -- resume` opens the menu in the sessions view.
+`codex-launcher -- resume <id>` opens it with the session's profile selected,
+whichever directory the session ran in, and passes the arguments to Codex
+unchanged. As in Codex, an argument that parses as a UUID is an ID, and anything
+else is a session's name. Until the sessions have been read, `Enter` launches
+nothing and says so.
+
+- When several profiles can resume the session, the menu selects the first and
+  asks which to use.
+- When several sessions have the name, the sessions view lists only them.
+  Resuming a session from the view then puts its ID in place of the name.
+- When no session has the ID or the name, or no profile can resume the session,
+  `default` stays selected, and the footer says why. Codex may still know the
+  session or its provider.
+
+The view reads these files as Codex 0.171.0 writes them. They are Codex
+internals that may change, so a log that the view cannot read is listed as
+`unknown`, in yellow, under the directory it records, or only under every
+directory when that is unknown too. A warning below the list counts these logs.
+
+- `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`, and the `.jsonl.zst` files
+  that Codex compresses older logs into. The view reads each log's first
+  record, `session_meta`, for the session's ID, directory, provider, source, and
+  git branch, then reads on to the first `turn_context` record, for the model,
+  giving up after 200 records or 8 MiB. Logs that share an ID are parts of one
+  session, whose last update is when its newest log changed.
+- `$CODEX_HOME/session_index.jsonl`, whose last entry for a session gives its
+  name.
+
+Like `codex resume` without `--include-non-interactive`, the view lists only
+sessions from Codex's terminal interface or an editor, leaving out `codex exec`
+runs and subagent threads. It never shows transcript content. The menu reads no
+logs until the view first opens or `-- resume` names a session, and then reads
+them in the background.
+
 ## Using it from scripts
 
 Each menu listens on a Unix socket at
@@ -370,7 +450,7 @@ codex-launcher ctl select local    # Move the selection to a profile by name.
 codex-launcher ctl effort high     # Set a temporary effort for the selection.
 codex-launcher ctl effort profile  # Clear the override; restore profile/arguments.
 codex-launcher ctl save-effort     # Save the temporary effort to the selected file.
-codex-launcher ctl launch          # Launch the selection, like pressing Enter.
+codex-launcher ctl launch          # Do what Enter does: launch or resume the selection.
 codex-launcher ctl quit
 ```
 
@@ -403,10 +483,31 @@ them. Each `menu` entry has its `server` state.
 
 `help` is null unless the help screen is open, from the keyboard or from
 `ctl key '?'` (quote the `?` so the shell does not expand it); then it reports
-the help's `scroll` and `max_scroll`. While the help or the effort picker is
-open, keys go to it instead of the menu: `r` does not check the servers, and
-`Esc` or `q` closes it rather than quitting. Read `help` and `effort_picker`
-before sending menu keys.
+the help's `scroll` and `max_scroll`. While the help, the effort picker, or the
+profile picker is open, keys go to it instead of the menu: `r` does not check
+the servers, and `Esc` or `q` closes it rather than quitting. Read `help`,
+`effort_picker`, and `profile_picker` before sending menu keys.
+
+`view` is `profiles` or `sessions`, and `ctl key tab` switches it. `command`
+and `command_line` are what `Enter` runs: in the sessions view, the selected
+session's resume command. They are null when `Enter` runs nothing at once, such
+as when it asks which profile resumes the session, or while `-- resume <id>`
+waits for the sessions. `sessions` is null until the view first opens or
+`-- resume` names a session. Then it reports `loading` while the logs are read,
+the `scope`, the `selected_index` among all rows, their number as `total`, and
+any `warnings`. The `scope` is `directory`, `all`, or `named` when the list
+shows only the sessions that share the name that `-- resume` gave.
+
+The `list` holds only the rows that the table shows, starting with row
+`offset`, so a long history does not lengthen every reply. Moving the
+selection brings other rows into view, and the list is empty in the profiles
+view. Each row has the session's `id`, the `title` that the list shows, its
+`name`, `branch`, `directory`, `updated` time in UTC, `model`, `provider`,
+matching `profiles`, `model_differs`, and `logs`. A log that could not be read
+has a null `id`, the title `unknown`, and an `error`. `profile_picker` reports
+the open picker's `session` ID, its `profiles`, and the `selected` index, or
+null. `ctl launch` with the picker open launches the highlighted profile.
+`ctl select` returns to the profiles view.
 
 ```
 $ codex-launcher ctl key down
@@ -417,6 +518,7 @@ $ codex-launcher ctl key down
   "cwd": "/home/me/project",
   "codex_home": "/home/me/.codex",
   "status": "selecting",
+  "view": "profiles",
   "selected": "gateway",
   "selected_index": 1,
   "command": ["codex", "--profile", "gateway"],
@@ -428,7 +530,8 @@ $ codex-launcher ctl key down
   ],
   "profile": {"name": "gateway", "model": {"value": "gpt-team", "source": "profile"}, ...},
   "details": {"scroll": 0, "max_scroll": 0},
-  "warnings": []
+  "warnings": [],
+  "sessions": null
 }
 ```
 

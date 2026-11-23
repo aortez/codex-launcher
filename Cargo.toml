@@ -24,6 +24,10 @@ serde_json = { version = "=1.0.154", features = ["preserve_order"] }
 toml_edit = "=0.25.18"
 tempfile = "=3.27.0"
 unicode-width = "=0.2.2"
+# Codex compresses older session logs, and the sessions view reads the start of
+# thousands of them. libzstd decodes them about twenty times faster than a pure
+# Rust decoder.
+zstd = { version = "=0.14.3", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
