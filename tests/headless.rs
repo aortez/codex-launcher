@@ -224,9 +224,13 @@ fn the_menu_hands_its_terminal_to_a_harness() {
     }
 
     // script from util-linux runs the menu in a pseudo-terminal. Other
-    // versions take other options.
+    // versions take other options. The test skips only off Linux, so that CI,
+    // which runs on Linux, cannot pass it without running it.
     let version = Command::new("script").arg("--version").output();
     if !version.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("util-linux")) {
+        if cfg!(target_os = "linux") {
+            panic!("this test needs script from util-linux");
+        }
         eprintln!("skipped: this test needs script from util-linux");
         return;
     }
