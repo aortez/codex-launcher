@@ -125,31 +125,49 @@ pub struct Sessions {
     pub warnings: Vec<String>,
 }
 
+/// Why `codex resume <arg>` names no single session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotFound {
+    /// No session has the ID or the name, as the message says.
+    Missing(String),
+    /// This many sessions have the name.
+    Shared(usize),
+}
+
 impl Sessions {
-    /// The session that `codex resume <arg>` resumes, from any directory, or
-    /// why there is no single one.
+    /// The session that `codex resume <arg>` resumes, from any directory, as
+    /// its index among the entries.
     ///
     /// An argument that parses as a UUID is an ID, as in Codex. Anything else
     /// must be the latest name of exactly one session.
-    pub fn find(&self, arg: &str) -> Result<&Session, String> {
-        let mut sessions = self.entries.iter().filter_map(Entry::session);
+    pub fn find(&self, arg: &str) -> Result<usize, NotFound> {
         if let Some(id) = parse_uuid(arg) {
-            return sessions
-                .find(|session| session.id == id)
-                .ok_or_else(|| format!("No session has ID {id}."));
+            return self
+                .entries
+                .iter()
+                .position(|entry| entry.session().is_some_and(|session| session.id == id))
+                .ok_or_else(|| NotFound::Missing(format!("No session has ID {id}.")));
         }
-        let named: Vec<&Session> = sessions
-            .filter(|session| session.name.as_deref() == Some(arg))
-            .collect();
+        let named: Vec<usize> = self.named(arg).collect();
         match named.as_slice() {
-            [session] => Ok(session),
-            [] => Err(format!("No session is named {:?}.", clean(arg))),
-            several => Err(format!(
-                "{} sessions are named {:?}.",
-                several.len(),
+            &[index] => Ok(index),
+            [] => Err(NotFound::Missing(format!(
+                "No session is named {:?}.",
                 clean(arg)
-            )),
+            ))),
+            several => Err(NotFound::Shared(several.len())),
         }
+    }
+
+    /// The indexes of the sessions whose latest name is `name`.
+    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, entry)| {
+                let session = entry.session()?;
+                (session.name.as_deref() == Some(name)).then_some(index)
+            })
     }
 }
 
@@ -875,8 +893,9 @@ mod tests {
         assert_eq!(listed(false), [id(1), id(2)]);
         assert_eq!(listed(true), [id(1), id(2), id(3)]);
         // Codex resumes any session by ID, so the rest stay findable.
-        assert_eq!(loaded.find(&id(4)).unwrap().id, id(4));
-        assert!(!loaded.find(&id(5)).unwrap().interactive);
+        let found = |id: &str| loaded.entries[loaded.find(id).unwrap()].session().unwrap();
+        assert_eq!(found(&id(4)).id, id(4));
+        assert!(!found(&id(5)).interactive);
     }
 
     #[test]
@@ -1078,7 +1097,12 @@ mod tests {
         let index: String = index.iter().map(|entry| format!("{entry}\n")).collect();
         fs::write(home.path().join(INDEX_FILE), index).unwrap();
         let loaded = load(home.path(), None);
-        let found = |arg: &str| loaded.find(arg).map(|session| session.id.clone());
+        let found = |arg: &str| {
+            loaded.find(arg).map(|index| {
+                let session = loaded.entries[index].session().unwrap();
+                session.id.clone()
+            })
+        };
         let upper = id(1).to_uppercase();
         let simple = id(1).replace('-', "");
         for form in [
@@ -1091,16 +1115,24 @@ mod tests {
             assert_eq!(found(&form), Ok(id(1)), "{form}");
         }
         assert_eq!(found("docs"), Ok(id(1)));
-        assert_eq!(
-            found("tests"),
-            Err("2 sessions are named \"tests\".".to_owned())
-        );
+        assert_eq!(found("tests"), Err(NotFound::Shared(2)));
+        let mut named: Vec<String> = loaded
+            .named("tests")
+            .map(|index| loaded.entries[index].session().unwrap().id.clone())
+            .collect();
+        named.sort();
+        assert_eq!(named, [id(2), id(3)]);
         assert_eq!(
             found("Docs"),
-            Err("No session is named \"Docs\".".to_owned())
+            Err(NotFound::Missing(
+                "No session is named \"Docs\".".to_owned()
+            ))
         );
         let absent = "019a0000-0000-7000-8000-0000000000ff";
-        assert_eq!(found(absent), Err(format!("No session has ID {absent}.")));
+        assert_eq!(
+            found(absent),
+            Err(NotFound::Missing(format!("No session has ID {absent}.")))
+        );
         for not_uuid in [
             &format!("{{{simple}}}"),
             &format!("urn:uuid:{simple}"),

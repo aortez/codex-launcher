@@ -130,6 +130,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     match app.page() {
         Page::Profiles => {
+            app.view.session_rows = 0..0;
             let list_width = list_width(app, body.width);
             let [list_area, details_area] =
                 Layout::horizontal([Constraint::Length(list_width), Constraint::Min(10)])
@@ -202,7 +203,8 @@ fn help_text(width: u16, page: Page) -> Text<'static> {
             lines.push(Line::from(vec![
                 Span::raw("Yellow").fg(Color::Yellow),
                 Span::raw(
-                    " marks a log that could not be read, or a session that no profile can resume.",
+                    " marks a log that could not be read, a session that no profile can resume, \
+                     or another model that resuming would load on a server you run.",
                 ),
             ]));
             &SESSION_KEYS
@@ -560,6 +562,7 @@ fn launch_lines(command: &Command, home: Option<&Path>) -> Vec<Line<'static>> {
 
 /// Draw the sessions table, with the selected entry's details below it.
 fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.view.session_rows = 0..0;
     let list = app.session_list();
     let block = sessions_block(app, list);
     let message = match list {
@@ -601,8 +604,14 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
     let table = session_table(app, list, block, table_area.width);
     let selected = list.selected();
+    let row_count = list.row_count();
     app.view.sessions.select(Some(selected));
     frame.render_stateful_widget(table, table_area, &mut app.view.sessions);
+    // One row per line, below the top border and the header, and above the
+    // bottom border.
+    let shown = usize::from(table_area.height.saturating_sub(3));
+    let first = app.view.sessions.offset();
+    app.view.session_rows = first..(first + shown).min(row_count);
     draw_scrolled(
         frame,
         details_area,
@@ -612,16 +621,17 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-/// The sessions table's border, titled with the directory it lists, and with
+/// The sessions table's border, titled with the sessions it lists, and with
 /// any warnings at the bottom.
 fn sessions_block(app: &App, list: Option<&SessionList>) -> Block<'static> {
-    let place = if list.is_some_and(SessionList::shows_all) {
-        "every directory".to_owned()
-    } else {
-        app.current_dir().map_or_else(
+    let named = list.and_then(SessionList::named);
+    let place = match (named, list.is_some_and(SessionList::shows_all)) {
+        (Some(name), _) => format!("named {:?}", clean(name)),
+        (None, true) => "every directory".to_owned(),
+        (None, false) => app.current_dir().map_or_else(
             || "this directory".to_owned(),
             |dir| clean(&display_path(dir, app.home())),
-        )
+        ),
     };
     let mut block = Block::bordered().title(format!(" Sessions · {place} "));
     if let Some(list) = list
@@ -647,7 +657,13 @@ fn session_table(
     block: Block<'static>,
     width: u16,
 ) -> Table<'static> {
-    let columns = if list.shows_all() { 5 } else { 4 };
+    // Only the list of the current directory's sessions leaves out their
+    // directory.
+    let columns = if list.shows_all() || list.named().is_some() {
+        5
+    } else {
+        4
+    };
     let now = SystemTime::now();
     let rows: Vec<Vec<(String, Style)>> = list
         .rows()
@@ -872,9 +888,18 @@ fn session_details(app: &App, entry: &Entry, width: usize) -> Text<'static> {
                 None => row("model", "(not recorded)".to_owned(), ""),
             };
             if matched.model_differs {
-                model.push_span(
-                    Span::raw(format!("  {}", other_model(app, &matched))).fg(Color::Yellow),
-                );
+                // A hosted provider just answers with the other model, but a
+                // server you run may have to load it first.
+                let note = Span::raw(format!("  {}", other_model(app, &matched)));
+                let loads = matched
+                    .profiles
+                    .iter()
+                    .any(|&index| app.launch_loads_model(index));
+                model.push_span(if loads {
+                    note.fg(Color::Yellow)
+                } else {
+                    note.dim()
+                });
             }
             lines.push(model);
             lines.push(session_profile_line(app, session, &matched));
@@ -1456,12 +1481,15 @@ mod tests {
     }
 
     #[test]
-    fn sessions_mark_what_cannot_resume_in_yellow() {
-        let (_home, mut app) = fixture_app();
-        app.set_current_dir(Path::new("/home/user/project"));
-        app.press(Key::Tab);
-        wait_for_sessions(&mut app);
-        app.press(Key::Char('a'));
+    fn sessions_show_problems_in_yellow() {
+        let (home, mut app) = fixture_app();
+        let every_directory = |app: &mut App| {
+            app.set_current_dir(Path::new("/home/user/project"));
+            app.press(Key::Tab);
+            wait_for_sessions(app);
+            app.press(Key::Char('a'));
+        };
+        every_directory(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
         // The style of the first cell of `text` in the first line that
         // contains `row`.
@@ -1492,13 +1520,14 @@ mod tests {
         };
         let yellow = Some(Color::Yellow);
 
-        // The "Review the docs" session on the gateway, with another model.
-        select(&mut app, "019a0000-0000-7000-8000-000000000005");
+        // The "Review the docs" session on the gateway, with another model,
+        // which the hosted gateway just answers with.
+        let review = "019a0000-0000-7000-8000-000000000005";
+        select(&mut app, review);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(
-            style_of(&terminal, "gateway uses gpt-team", "gateway").fg,
-            yellow
-        );
+        let note = style_of(&terminal, "gateway uses gpt-team", "gateway");
+        assert_ne!(note.fg, yellow);
+        assert!(note.add_modifier.contains(Modifier::DIM));
         assert_eq!(style_of(&terminal, "│  unknown", "unknown").fg, yellow);
         assert_ne!(
             style_of(&terminal, "│> Review the docs", "Review").fg,
@@ -1514,6 +1543,26 @@ mod tests {
         assert_eq!(style_of(&terminal, "│> Lab notes", "none").fg, yellow);
         assert_eq!(
             style_of(&terminal, "none  needs a profile", "none").fg,
+            yellow
+        );
+
+        // A wrapper may start the gateway profile's own model, and Ollama
+        // loads whichever model it is asked for.
+        let index = |app: &App, name: &str| app.catalog().index_of(name).unwrap();
+        assert!(app.launch_loads_model(index(&app, "local")));
+        assert!(!app.launch_loads_model(index(&app, "gateway")));
+        std::fs::write(
+            home.path().join("codex-launcher.toml"),
+            "[[wrapper]]\nprofiles = [\"gateway\"]\nlaunch = [\"/opt/gateway/run\", \"{profile}\"]\n",
+        )
+        .unwrap();
+        let mut app = App::new(crate::profile::load(home.path()).unwrap(), &[], None, None);
+        every_directory(&mut app);
+        assert!(app.launch_loads_model(index(&app, "gateway")));
+        select(&mut app, review);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            style_of(&terminal, "gateway uses gpt-team", "gateway").fg,
             yellow
         );
     }

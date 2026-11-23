@@ -4,6 +4,7 @@
 //! `ctl key` request behaves exactly like the same key typed in the menu.
 
 use std::ffi::OsStr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use crate::check::{self, Checks, State};
 use crate::effort::{self, Choices};
 use crate::launch::{Command, Program};
 use crate::profile::{self, Catalog, Profile, Provider, Setting, Source};
-use crate::sessions::{self, Entry, Loader, Match, Session, Sessions};
+use crate::sessions::{self, Entry, Loader, Match, NotFound, Session, Sessions};
 
 /// The Codex subcommand that resumes a session.
 const RESUME: &str = "resume";
@@ -23,6 +24,13 @@ const RESUME: &str = "resume";
 /// Why the sessions view cannot resume a session with these launch arguments.
 pub const LAUNCH_ARGUMENTS_NOTICE: &str =
     "Sessions resume only without launch arguments, or with a bare \"resume\".";
+
+/// Why Enter does nothing yet: the sessions decide what it runs.
+const STILL_READING: &str = "The sessions are still being read.";
+
+/// Built-in providers whose servers load whichever model a request names,
+/// usually on this machine.
+const LOCAL_PROVIDERS: &[&str] = &["lmstudio", "ollama"];
 
 /// A key press, from the terminal or from `ctl key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +216,9 @@ pub struct View {
     pub list: ListState,
     pub details: Scroll,
     pub sessions: TableState,
+    /// The rows that the sessions table showed when last drawn, which
+    /// `ctl state` reports.
+    pub session_rows: Range<usize>,
     pub session_details: Scroll,
 }
 
@@ -280,6 +291,9 @@ pub struct App {
     /// The session that `-- resume <arg>` names, until the sessions arrive to
     /// say which profile resumes it.
     resume_target: Option<String>,
+    /// Whether `-- resume <name>` named several sessions. Resuming one from
+    /// the sessions view then puts its ID in place of the name.
+    target_shared: bool,
     pub profile_picker: Option<ProfilePicker>,
 }
 
@@ -297,6 +311,9 @@ pub struct ProfilePicker {
     /// Indexes of the matching profiles.
     pub profiles: Vec<usize>,
     pub selected: usize,
+    /// Whether the picked profile runs with the launch arguments as given,
+    /// since `-- resume <session>` already names the session.
+    keeps_arguments: bool,
 }
 
 /// The sessions view's list.
@@ -306,6 +323,9 @@ pub struct SessionList {
     sessions: Sessions,
     /// Whether the list shows every directory rather than the current one.
     all: bool,
+    /// The name that `-- resume <name>` found on several sessions, while the
+    /// list shows only them.
+    named: Option<String>,
     /// Indexes into `sessions.entries` of the rows shown.
     rows: Vec<usize>,
     /// The selected row.
@@ -319,6 +339,21 @@ impl SessionList {
 
     pub fn shows_all(&self) -> bool {
         self.all
+    }
+
+    /// The name that every listed session shares, when the list shows only
+    /// the sessions that `-- resume <name>` names.
+    pub fn named(&self) -> Option<&str> {
+        self.named.as_deref()
+    }
+
+    /// Which sessions the list shows, as `ctl state` reports it.
+    fn scope(&self) -> &'static str {
+        match (&self.named, self.all) {
+            (Some(_), _) => "named",
+            (None, true) => "all",
+            (None, false) => "directory",
+        }
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -348,9 +383,12 @@ impl SessionList {
     /// it is still shown.
     fn refresh(&mut self) {
         let selected = self.rows.get(self.selected).copied();
-        self.rows = (0..self.sessions.entries.len())
-            .filter(|&index| self.sessions.entries[index].is_listed(self.all))
-            .collect();
+        self.rows = match &self.named {
+            Some(name) => self.sessions.named(name).collect(),
+            None => (0..self.sessions.entries.len())
+                .filter(|&index| self.sessions.entries[index].is_listed(self.all))
+                .collect(),
+        };
         self.selected = selected
             .and_then(|entry| self.rows.iter().position(|&row| row == entry))
             .unwrap_or(0);
@@ -428,6 +466,7 @@ impl App {
             sessions: None,
             current_dir: std::env::current_dir().ok(),
             resume_target,
+            target_shared: false,
             profile_picker: None,
         }
     }
@@ -466,32 +505,57 @@ impl App {
     /// profile's launch command, then `resume <id>`. None when the launch
     /// arguments already say what to run.
     pub fn session_command(&self, session: &Session, index: usize) -> Option<Command> {
-        if !self.arguments_allow_resuming() {
-            return None;
-        }
-        let mut command = self.commands[index].clone();
-        // A bare `resume` in the launch arguments already ends the command.
-        if self.extra_args.is_empty() {
-            command.args.push(RESUME.to_owned());
-        }
-        command.args.push(session.id.clone());
-        Some(command)
+        let args = self.resume_arguments(&session.id)?;
+        let mut command = self.base_commands[index].clone();
+        // The launch arguments come last, and these take their place.
+        command
+            .args
+            .truncate(command.args.len() - self.extra_args.len());
+        command.args.extend(args);
+        Some(match &self.effort_overrides[index] {
+            Some(setting) => command.with_effort(&setting.value),
+            None => command,
+        })
     }
 
-    /// Whether the launch arguments leave room for a session to resume: there
-    /// are none, or only a bare `resume`.
-    fn arguments_allow_resuming(&self) -> bool {
+    /// The launch arguments that resume the session `id`, or None when the
+    /// launch arguments already say what to run. No launch arguments, or a
+    /// bare `resume`, become `resume <id>`, and the ID replaces a name that
+    /// several sessions share.
+    fn resume_arguments(&self, id: &str) -> Option<Vec<String>> {
+        let resume = || [RESUME.to_owned(), id.to_owned()].into_iter();
         match self.extra_args.as_slice() {
-            [] => true,
-            [resume] => *resume == RESUME,
-            _ => false,
+            [] => Some(resume().collect()),
+            [first] if *first == RESUME => Some(resume().collect()),
+            [first, _name, rest @ ..] if *first == RESUME && self.target_shared => {
+                Some(resume().chain(rest.iter().cloned()).collect())
+            }
+            _ => None,
         }
+    }
+
+    /// Whether launching the profile at `index` can start another model on a
+    /// server you run: it launches through a wrapper, or its provider loads
+    /// whichever model a request names.
+    pub fn launch_loads_model(&self, index: usize) -> bool {
+        self.commands[index].wrapper.is_some()
+            || LOCAL_PROVIDERS.contains(&self.catalog.profiles[index].provider.id.as_str())
     }
 
     /// The session that the open profile picker resumes.
     pub fn picker_session(&self) -> Option<&Session> {
         let picker = self.profile_picker.as_ref()?;
         self.sessions.as_ref()?.sessions.entries[picker.entry].session()
+    }
+
+    /// What launching the open picker's highlighted profile runs.
+    fn picker_command(&self) -> Option<Command> {
+        let picker = self.profile_picker.as_ref()?;
+        let index = picker.profiles[picker.selected];
+        if picker.keeps_arguments {
+            return Some(self.commands[index].clone());
+        }
+        self.session_command(self.picker_session()?, index)
     }
 
     /// Start reading sessions once something needs them, and show them once
@@ -525,56 +589,71 @@ impl App {
                 )),
                 sessions: Sessions::default(),
                 all: false,
+                named: None,
                 rows: Vec::new(),
                 selected: 0,
             });
         }
     }
 
-    /// Select the profile that resumes the session `target` names, or say
-    /// why there is no single one.
+    /// Select the profile that resumes the session `target` names, or offer
+    /// the choices when there are several. When there is none, `default`
+    /// stays selected, since Codex may know the session or the provider.
     fn resolve_resume(&mut self, target: &str) {
-        let Some(list) = &self.sessions else {
+        let Some(list) = &mut self.sessions else {
             return;
         };
-        let resolved = list.sessions.find(target).and_then(|session| {
-            let title = sessions::clean(session.title());
-            match sessions::matching(session, &self.catalog)
-                .profiles
-                .as_slice()
-            {
-                &[index] => Ok((index, title)),
-                [] => Err(format!(
-                    "No profile can resume {title:?}: it needs provider {}.",
-                    sessions::clean(&session.provider)
-                )),
-                several => Err(format!(
-                    "{title:?} matches {}; select one.",
-                    self.profile_names(several)
-                )),
+        let entry = match list.sessions.find(target) {
+            Ok(entry) => entry,
+            Err(NotFound::Missing(notice)) => {
+                self.notice = Some(notice);
+                return;
             }
-        });
-        match resolved {
-            Ok((index, title)) => {
+            Err(NotFound::Shared(count)) => {
+                // The sessions view lists them, and the one chosen there
+                // resumes by its ID instead of the name.
+                list.named = Some(target.to_owned());
+                list.refresh();
+                list.selected = 0;
+                self.target_shared = true;
+                self.page = Page::Sessions;
+                self.notice = Some(format!(
+                    "{count} sessions are named {:?}; choose one.",
+                    sessions::clean(target)
+                ));
+                return;
+            }
+        };
+        let Some(session) = list.sessions.entries[entry].session() else {
+            return;
+        };
+        let title = sessions::clean(session.title());
+        let provider = sessions::clean(&session.provider);
+        let profiles = sessions::matching(session, &self.catalog).profiles;
+        match profiles.as_slice() {
+            &[index] => {
                 self.select(index);
                 self.notice = Some(format!(
                     "Selected {} for session {title:?}.",
                     self.catalog.profiles[index].name
                 ));
             }
-            Err(notice) => self.notice = Some(notice),
-        }
-    }
-
-    /// The names of the profiles at `indexes`, as in "a, b and c".
-    fn profile_names(&self, indexes: &[usize]) -> String {
-        let names: Vec<&str> = indexes
-            .iter()
-            .map(|&index| self.catalog.profiles[index].name.as_str())
-            .collect();
-        match names.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-            _ => names.concat(),
+            [] => {
+                self.notice = Some(format!(
+                    "No profile can resume {title:?}: it needs provider {provider}."
+                ));
+            }
+            &[first, ..] => {
+                // Dismissing the picker leaves a profile selected that can
+                // resume the session.
+                self.select(first);
+                self.profile_picker = Some(ProfilePicker {
+                    entry,
+                    profiles,
+                    selected: 0,
+                    keeps_arguments: true,
+                });
+            }
         }
     }
 
@@ -889,12 +968,17 @@ impl App {
 
     /// Resume the open picker's session with its highlighted profile.
     fn launch_picked(&mut self) {
-        let command = self.profile_picker.as_ref().and_then(|picker| {
-            self.session_command(self.picker_session()?, picker.profiles[picker.selected])
-        });
-        if let Some(command) = command {
-            self.status = Status::Launching(command);
+        let Some(command) = self.picker_command() else {
+            return;
+        };
+        if let Some(picker) = self.profile_picker.take()
+            && picker.keeps_arguments
+        {
+            // The picker chose among the profiles in the menu, so select the
+            // one launched.
+            self.select(picker.profiles[picker.selected]);
         }
+        self.status = Status::Launching(command);
     }
 
     /// While the help is open, keys scroll or close it, and Ctrl-C quits.
@@ -944,7 +1028,11 @@ impl App {
             // Only the sessions view has directories to switch between.
             Action::SwitchDirectories => {}
             Action::Help => self.open_help(),
-            Action::Launch => self.status = Status::Launching(self.command().clone()),
+            Action::Launch => match self.enter_command() {
+                Some(command) => self.status = Status::Launching(command),
+                // `-- resume <session>` may still select another profile.
+                None => self.notice = Some(STILL_READING.to_owned()),
+            },
             Action::Quit => self.status = Status::Quitting,
         }
     }
@@ -1006,7 +1094,9 @@ impl App {
             return;
         };
         let before = list.rows.get(list.selected).copied();
-        list.all = !list.all;
+        // Sessions that share a name can come from any directory, so every
+        // directory follows them.
+        list.all = list.named.take().is_some() || !list.all;
         list.refresh();
         if list.rows.get(list.selected).copied() != before {
             self.view.session_details.offset = 0;
@@ -1031,7 +1121,7 @@ impl App {
             return Resume::Nothing;
         };
         if list.is_loading() {
-            return Resume::Refuse("The sessions are still being read.".to_owned());
+            return Resume::Refuse(STILL_READING.to_owned());
         }
         let Some(&entry) = list.rows.get(list.selected) else {
             return Resume::Nothing;
@@ -1048,7 +1138,7 @@ impl App {
                 sessions::clean(&session.provider)
             ));
         }
-        if !self.arguments_allow_resuming() {
+        if self.resume_arguments(&session.id).is_none() {
             return Resume::Refuse(LAUNCH_ARGUMENTS_NOTICE.to_owned());
         }
         match matched.profiles.as_slice() {
@@ -1059,17 +1149,20 @@ impl App {
                 entry,
                 profiles: several.to_vec(),
                 selected: 0,
+                keeps_arguments: false,
             }),
         }
     }
 
     /// The command that Enter runs now, if it runs one.
     fn enter_command(&self) -> Option<Command> {
-        if let Some(picker) = &self.profile_picker {
-            return self.session_command(self.picker_session()?, picker.profiles[picker.selected]);
+        if self.profile_picker.is_some() {
+            return self.picker_command();
         }
         match self.page {
-            Page::Profiles => Some(self.command().clone()),
+            // Until the sessions arrive, `-- resume <session>` may still
+            // select another profile.
+            Page::Profiles => self.resume_target.is_none().then(|| self.command().clone()),
             Page::Sessions => match self.resume() {
                 Resume::Launch(command) => Some(command),
                 _ => None,
@@ -1163,12 +1256,23 @@ impl App {
                 Page::Sessions => &self.view.session_details,
             },
             warnings: &self.catalog.warnings,
-            sessions: self.sessions.as_ref().map(|list| SessionsView {
-                loading: list.is_loading(),
-                scope: if list.all { "all" } else { "directory" },
-                selected_index: (!list.rows.is_empty()).then_some(list.selected),
-                list: list.rows().map(|entry| self.session_row(entry)).collect(),
-                warnings: list.warnings(),
+            sessions: self.sessions.as_ref().map(|list| {
+                // Only the rows on screen, so that a long history does not
+                // lengthen every reply.
+                let end = self.view.session_rows.end.min(list.rows.len());
+                let start = self.view.session_rows.start.min(end);
+                SessionsView {
+                    loading: list.is_loading(),
+                    scope: list.scope(),
+                    selected_index: (!list.rows.is_empty()).then_some(list.selected),
+                    total: list.rows.len(),
+                    offset: start,
+                    list: list.rows[start..end]
+                        .iter()
+                        .map(|&index| self.session_row(&list.sessions.entries[index]))
+                        .collect(),
+                    warnings: list.warnings(),
+                }
             }),
         }
     }
@@ -1297,11 +1401,17 @@ pub struct ProfilePickerView<'a> {
 pub struct SessionsView<'a> {
     /// Whether the sessions are still being read.
     pub loading: bool,
-    /// `directory` for the current directory's sessions, or `all`.
+    /// `directory` for the current directory's sessions, `all`, or `named`
+    /// for the sessions that share the name that `-- resume` gave.
     pub scope: &'static str,
-    /// The selected row, or null when there are none.
+    /// The selected row, counting from the first of `total`, or null when
+    /// there are none.
     pub selected_index: Option<usize>,
-    /// The rows shown, newest first.
+    /// How many rows the list has.
+    pub total: usize,
+    /// The row that `list` starts with.
+    pub offset: usize,
+    /// The rows that the table shows, newest first.
     pub list: Vec<SessionRow<'a>>,
     pub warnings: &'a [String],
 }
@@ -1624,6 +1734,41 @@ mod tests {
         let mut app = App::new(profile::load(home.path()).unwrap(), &args, None, None);
         crate::test_support::wait_for_sessions(&mut app);
         assert_eq!(app.selected_profile().name, "gateway");
+    }
+
+    #[test]
+    fn enter_waits_for_the_session_that_resume_names() {
+        let home = crate::test_support::fixture_home();
+        let args = ["resume".to_owned(), "Fix the flaky tests".to_owned()];
+        let mut app = App::new(profile::load(home.path()).unwrap(), &args, None, None);
+        let instance = Instance {
+            pid: 42,
+            mode: "headless",
+            tty: None,
+            cwd: None,
+        };
+        // Until the sessions arrive, default is selected but may not resume
+        // the session.
+        assert!(app.state(&instance).command.is_none());
+        app.press(Key::Enter);
+        assert_eq!(app.status(), &Status::Selecting);
+        assert_eq!(app.notice.as_deref(), Some(STILL_READING));
+
+        crate::test_support::wait_for_sessions(&mut app);
+        app.press(Key::Enter);
+        let Status::Launching(command) = app.status() else {
+            panic!("not launching: {:?}", app.status());
+        };
+        assert_eq!(
+            command.argv(),
+            [
+                "codex",
+                "--profile",
+                "gateway",
+                "resume",
+                "Fix the flaky tests"
+            ]
+        );
     }
 
     #[test]

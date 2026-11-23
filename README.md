@@ -383,8 +383,10 @@ each session:
 - Otherwise the session's profile is `none`, in yellow, and the details name the
   provider that it needs.
 - A session's model is its first turn's, since that reflects the profile that
-  started it. When the matching profile uses another model, the details say so
-  in yellow.
+  started it. When the matching profile uses another model, the details say so.
+  The note is yellow when the profile launches through a wrapper or uses the
+  `ollama` or `lmstudio` provider, since resuming may then load the other model
+  on a server that you run.
 - Custom harness entries never match, and neither does a profile with a file
   error or an undefined provider.
 
@@ -400,8 +402,16 @@ picker inside the profile.
 `codex-launcher -- resume <id>` opens it with the session's profile selected,
 whichever directory the session ran in, and passes the arguments to Codex
 unchanged. As in Codex, an argument that parses as a UUID is an ID, and anything
-else must be the name of exactly one session. When no single session or profile
-matches, the menu opens as usual and says why in the footer.
+else is a session's name. Until the sessions have been read, `Enter` launches
+nothing and says so.
+
+- When several profiles can resume the session, the menu selects the first and
+  asks which to use.
+- When several sessions have the name, the sessions view lists only them.
+  Resuming a session from the view then puts its ID in place of the name.
+- When no session has the ID or the name, or no profile can resume the session,
+  `default` stays selected, and the footer says why. Codex may still know the
+  session or its provider.
 
 The view reads these files as Codex 0.171.0 writes them. They are Codex
 internals that may change, so a log that the view cannot read is listed as
@@ -480,17 +490,23 @@ the servers, and `Esc` or `q` closes it rather than quitting. Read `help`,
 `view` is `profiles` or `sessions`, and `ctl key tab` switches it. `command`
 and `command_line` are what `Enter` runs: in the sessions view, the selected
 session's resume command. They are null when `Enter` runs nothing at once, such
-as when it asks which profile resumes the session. `sessions` is null until the
-view first opens or `-- resume` names a session. Then it reports `loading`
-while the logs are read, the `scope` (`directory` or `all`), the
-`selected_index`, any `warnings`, and the `list` of rows. Each row has the
-session's `id`, the `title` that the list shows, its `name`, `branch`,
-`directory`, `updated` time in UTC, `model`, `provider`, matching `profiles`,
-`model_differs`, and `logs`. A log that could not be read has a null `id`, the
-title `unknown`, and an `error`. `profile_picker` reports the open picker's
-`session` ID, its `profiles`, and the `selected` index, or null. `ctl launch`
-with the picker open launches the highlighted profile. `ctl select` returns to
-the profiles view.
+as when it asks which profile resumes the session, or while `-- resume <id>`
+waits for the sessions. `sessions` is null until the view first opens or
+`-- resume` names a session. Then it reports `loading` while the logs are read,
+the `scope`, the `selected_index` among all rows, their number as `total`, and
+any `warnings`. The `scope` is `directory`, `all`, or `named` when the list
+shows only the sessions that share the name that `-- resume` gave.
+
+The `list` holds only the rows that the table shows, starting with row
+`offset`, so a long history does not lengthen every reply. Moving the
+selection brings other rows into view, and the list is empty in the profiles
+view. Each row has the session's `id`, the `title` that the list shows, its
+`name`, `branch`, `directory`, `updated` time in UTC, `model`, `provider`,
+matching `profiles`, `model_differs`, and `logs`. A log that could not be read
+has a null `id`, the title `unknown`, and an `error`. `profile_picker` reports
+the open picker's `session` ID, its `profiles`, and the `selected` index, or
+null. `ctl launch` with the picker open launches the highlighted profile.
+`ctl select` returns to the profiles view.
 
 ```
 $ codex-launcher ctl key down

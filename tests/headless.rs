@@ -422,20 +422,21 @@ impl Headless {
         Self::launch(codex_home, &args, path, env)
     }
 
-    /// Start with server checks off, in the fixture sessions' project.
+    /// Start with server checks off, in the fixture sessions' project, on a
+    /// screen that shows every fixture session.
     fn start_in_project(sessions: &SessionsFixture, args: &[&str]) -> Self {
-        Self::start_in_project_with_path(sessions, args, Path::new("/nonexistent"))
+        Self::start_in_project_sized(sessions, "120x40", args)
     }
 
-    fn start_in_project_with_path(sessions: &SessionsFixture, args: &[&str], path: &Path) -> Self {
-        let args: Vec<&str> = ["--no-check", "--size", "120x40"]
+    fn start_in_project_sized(sessions: &SessionsFixture, size: &str, args: &[&str]) -> Self {
+        let args: Vec<&str> = ["--no-check", "--size", size]
             .into_iter()
             .chain(args.iter().copied())
             .collect();
         Self::launch_in(
             sessions.home.path(),
             &args,
-            path,
+            Path::new("/nonexistent"),
             &[],
             Some(sessions.project.path()),
         )
@@ -536,19 +537,24 @@ impl Headless {
         }
     }
 
-    /// Select the listed session with this title, and return the state.
+    /// Select the session on screen with this title, and return the state.
     fn select_session(&self, title: &str) -> Value {
         let state = self.sessions_state();
         let list = state["sessions"]["list"].as_array().unwrap();
-        let index = list
-            .iter()
-            .position(|row| row["title"] == title)
-            .unwrap_or_else(|| panic!("no session {title:?} in {list:?}"));
+        let row = shown_from(&state)
+            + list
+                .iter()
+                .position(|row| row["title"] == title)
+                .unwrap_or_else(|| panic!("no session {title:?} in {list:?}"));
         let keys: Vec<&str> = std::iter::once("home")
-            .chain(std::iter::repeat_n("down", index))
+            .chain(std::iter::repeat_n("down", row))
             .collect();
         let state = self.ctl_json(&std::iter::once("key").chain(keys).collect::<Vec<_>>());
-        assert_eq!(state["sessions"]["list"][index]["title"], title);
+        assert_eq!(state["sessions"]["selected_index"], row);
+        assert_eq!(
+            state["sessions"]["list"][row - shown_from(&state)]["title"],
+            title
+        );
         state
     }
 
@@ -1983,6 +1989,11 @@ fn session_rows(state: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The row that the state's list of sessions starts with.
+fn shown_from(state: &Value) -> usize {
+    usize::try_from(state["sessions"]["offset"].as_u64().unwrap()).unwrap()
+}
+
 fn assert_shows(screen: &str, expected: &[&str]) {
     for expected in expected {
         assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
@@ -2273,18 +2284,21 @@ fn sessions_resume_only_without_other_launch_arguments() {
     }
 }
 
+/// Start a menu in another directory with `-- resume <target>`, and wait
+/// for it to find the session.
+fn resumed(home: &Path, target: &str) -> (Headless, Value) {
+    let menu = Headless::start_in(home, &["--", "resume", target]);
+    let state = menu.sessions_state();
+    (menu, state)
+}
+
 #[test]
 fn resume_arguments_select_the_sessions_profile() {
     let sessions = SessionsFixture::new();
     // The session's directory does not matter.
-    let resumed = |home: &Path, target: &str| {
-        let menu = Headless::start_in(home, &["--", "resume", target]);
-        let state = menu.sessions_state();
-        assert_eq!(state["view"], "profiles");
-        (menu, state)
-    };
     let id1 = session_id(1);
     let (menu, state) = resumed(sessions.home.path(), &id1);
+    assert_eq!(state["view"], "profiles");
     assert_eq!(state["selected"], "gateway");
     assert_eq!(
         state["notice"],
@@ -2298,11 +2312,8 @@ fn resume_arguments_select_the_sessions_profile() {
     let (_menu, state) = resumed(sessions.home.path(), "Try the local model");
     assert_eq!(state["selected"], "local");
 
+    // Codex may know a session or provider that the launcher does not.
     for (target, notice) in [
-        (
-            "Review the docs",
-            "2 sessions are named \"Review the docs\".",
-        ),
         (
             "Lab notes",
             "No profile can resume \"Lab notes\": it needs provider lab.",
@@ -2313,15 +2324,136 @@ fn resume_arguments_select_the_sessions_profile() {
         ),
     ] {
         let (_menu, state) = resumed(sessions.home.path(), target);
+        assert_eq!(state["view"], "profiles", "{target}");
         assert_eq!(state["selected"], "default", "{target}");
         assert_eq!(state["notice"], notice, "{target}");
+        assert_eq!(
+            state["command"],
+            serde_json::json!(["codex", "resume", target])
+        );
     }
 
+    // When two profiles can resume the session, the menu selects the first
+    // and asks.
     let sessions = sessions.with_backup_and_lab();
-    let (_menu, state) = resumed(sessions.home.path(), &id1);
-    assert_eq!(state["selected"], "default");
+    let (menu, state) = resumed(sessions.home.path(), &id1);
+    assert_eq!(state["selected"], "gateway");
+    assert!(state["notice"].is_null(), "{state}");
+    assert_eq!(
+        state["profile_picker"],
+        serde_json::json!({"session": id1, "profiles": ["gateway", "gateway-backup"], "selected": 0})
+    );
+    assert_shows(
+        &menu.screen(),
+        &[
+            " Resume with ",
+            "Several profiles can resume \"Fix the flaky tests\".",
+        ],
+    );
+    let state = menu.ctl_json(&["key", "down"]);
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "--profile", "gateway-backup", "resume", id1])
+    );
+    // Dismissing the picker leaves the first selected.
+    let state = menu.ctl_json(&["key", "esc"]);
+    assert!(state["profile_picker"].is_null());
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "--profile", "gateway", "resume", id1])
+    );
+    let (menu, _) = resumed(sessions.home.path(), &id1);
+    let state = menu.ctl_json(&["key", "down", "enter"]);
+    assert_eq!(state["status"], "launching");
+    assert_eq!(state["selected"], "gateway-backup");
+    assert_eq!(
+        menu.finish(),
+        format!("codex --profile gateway-backup resume {id1}\n")
+    );
+}
+
+#[test]
+fn a_name_that_sessions_share_lists_them_to_choose_from() {
+    let sessions = SessionsFixture::new();
+    let (id1, id5, id10) = (session_id(1), session_id(5), session_id(10));
+    let (menu, state) = resumed(sessions.home.path(), "Review the docs");
+    assert_eq!(state["view"], "sessions");
     assert_eq!(
         state["notice"],
-        "\"Fix the flaky tests\" matches gateway and gateway-backup; select one."
+        "2 sessions are named \"Review the docs\"; choose one."
     );
+    let listed = &state["sessions"];
+    assert_eq!(listed["scope"], "named");
+    assert_eq!(listed["total"], 2);
+    assert_eq!(
+        session_rows(&state),
+        [
+            "Review the docs | gpt-team-mini | gateway",
+            "Review the docs | gpt-base | default",
+        ]
+    );
+    // The chosen session resumes by its ID, in place of the name.
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "--profile", "gateway", "resume", id5])
+    );
+    assert_shows(
+        &menu.screen(),
+        &[" Sessions · named \"Review the docs\" ", "Directory"],
+    );
+    let state = menu.ctl_json(&["key", "down"]);
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "resume", id10])
+    );
+    assert_shows(&menu.screen(), &["a every directory"]);
+
+    // Every directory keeps the selection, and any session can resume.
+    let state = menu.ctl_json(&["key", "a"]);
+    assert_eq!(state["sessions"]["scope"], "all");
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "resume", id10])
+    );
+    let state = menu.select_session("Fix the flaky tests");
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "--profile", "gateway", "resume", id1])
+    );
+    // The profiles view passes the name to Codex unchanged.
+    let state = menu.ctl_json(&["key", "tab"]);
+    assert_eq!(
+        state["command"],
+        serde_json::json!(["codex", "resume", "Review the docs"])
+    );
+    menu.ctl_json(&["key", "tab", "enter"]);
+    assert_eq!(
+        menu.finish(),
+        format!("codex --profile gateway resume {id1}\n")
+    );
+}
+
+#[test]
+fn ctl_state_lists_only_the_sessions_on_screen() {
+    let sessions = SessionsFixture::new();
+    let menu = Headless::start_in_project_sized(&sessions, "80x16", &[]);
+    menu.ctl_json(&["key", "tab", "a"]);
+    let state = menu.sessions_state();
+    let listed = &state["sessions"];
+    assert_eq!(listed["total"], 9);
+    assert_eq!(shown_from(&state), 0);
+    let shown = listed["list"].as_array().unwrap().len();
+    assert!(0 < shown && shown < 9, "{state}");
+
+    // Moving the selection scrolls the table, and the list with it.
+    let state = menu.ctl_json(&["key", "end"]);
+    assert_eq!(state["sessions"]["selected_index"], 8);
+    let rows = session_rows(&state);
+    assert_eq!(shown_from(&state) + rows.len(), 9);
+    assert_eq!(rows.last().unwrap(), "Review the docs | gpt-base | default");
+
+    // The profiles view shows no sessions.
+    let state = menu.ctl_json(&["key", "tab"]);
+    assert_eq!(state["sessions"]["list"], serde_json::json!([]));
+    assert_eq!(state["sessions"]["total"], 9);
 }
